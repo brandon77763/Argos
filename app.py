@@ -203,14 +203,14 @@ with gr.Blocks(title="Argos Lead Finder") as demo:
         with gr.Tab("Search"):
             with gr.Group():
                 with gr.Row():
-                    domains = gr.Textbox(label="Domains", placeholder="example.com, example.org", scale=2)
-                    keywords = gr.Textbox(label="Keywords", placeholder="sales, marketing, contact", scale=2)
+                    domains = gr.Textbox(label="Domains", placeholder="example.com, example.org")
+                    keywords = gr.Textbox(label="Keywords", placeholder="sales, marketing, contact")
                 with gr.Row():
-                    extra = gr.Textbox(label="Extra terms", placeholder="press, team, partners", scale=3)
-                    max_results = gr.Slider(10, 100, value=30, step=5, label="Max results/query", scale=1)
+                    extra = gr.Textbox(label="Extra terms", placeholder="press, team, partners")
+                    max_results = gr.Slider(10, 100, value=30, step=5, label="Max results/query")
                 with gr.Row():
-                    search_btn = gr.Button("Search & Extract", variant="primary", scale=1)
-                    status = gr.Markdown("", elem_id="status", scale=3)
+                    search_btn = gr.Button("Search & Extract", variant="primary")
+                    status = gr.Markdown("", elem_id="status")
 
         with gr.Tab("Leads"):
             gr.Markdown("### Leads table\nEdit cells inline. Use controls below to add/remove columns and rows, or import/export.")
@@ -221,7 +221,6 @@ with gr.Blocks(title="Argos Lead Finder") as demo:
                 col_count=(len(DEFAULT_COLUMNS), "dynamic"),
                 wrap=True,
                 interactive=True,
-                height=420,
             )
 
             with gr.Row():
@@ -242,8 +241,10 @@ with gr.Blocks(title="Argos Lead Finder") as demo:
                         imp = gr.File(label="CSV file", file_types=[".csv"], type="binary")
                         import_btn = gr.Button("Import & Merge")
                     with gr.Row():
-                        export_csv_btn = gr.DownloadButton("Export CSV", file_name="leads.csv")
-                        export_json_btn = gr.DownloadButton("Export JSON", file_name="leads.json")
+                        export_csv_btn = gr.Button("Export CSV")
+                        export_json_btn = gr.Button("Export JSON")
+                        download_csv = gr.File(label="CSV", interactive=False)
+                        download_json = gr.File(label="JSON", interactive=False)
 
     async def do_search(domains_val, keywords_val, extra_val, max_results_val, table):
         status.update("Running search…")
@@ -323,19 +324,19 @@ with gr.Blocks(title="Argos Lead Finder") as demo:
         except Exception:
             return cur
 
-    def to_csv_bytes(table):
-        import io
+    def to_csv_file(table):
+        import tempfile
         cur = table if isinstance(table, pd.DataFrame) else pd.DataFrame(table or [], columns=df.headers)
-        buff = io.StringIO()
-        cur.to_csv(buff, index=False)
-        return buff.getvalue()
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".csv")
+        cur.to_csv(tmp.name, index=False)
+        return tmp.name
 
-    def to_json_bytes(table):
-        import io
+    def to_json_file(table):
+        import tempfile
         cur = table if isinstance(table, pd.DataFrame) else pd.DataFrame(table or [], columns=df.headers)
-        buff = io.StringIO()
-        cur.to_json(buff, orient="records", indent=2)
-        return buff.getvalue()
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
+        cur.to_json(tmp.name, orient="records", indent=2)
+        return tmp.name
 
     search_btn.click(do_search, inputs=[domains, keywords, extra, max_results, df], outputs=df)
     add_col_btn.click(add_column, inputs=[df, add_col_name], outputs=df)
@@ -343,8 +344,8 @@ with gr.Blocks(title="Argos Lead Finder") as demo:
     add_row_btn.click(add_row, inputs=[df], outputs=df)
     del_row_btn.click(del_row, inputs=[df, del_row_idx], outputs=df)
     import_btn.click(do_import, inputs=[imp, df], outputs=df)
-    export_csv_btn.click(to_csv_bytes, inputs=[df], outputs=export_csv_btn)
-    export_json_btn.click(to_json_bytes, inputs=[df], outputs=export_json_btn)
+    export_csv_btn.click(to_csv_file, inputs=[df], outputs=download_csv)
+    export_json_btn.click(to_json_file, inputs=[df], outputs=download_json)
 
 if __name__ == "__main__":
     demo.queue().launch()
