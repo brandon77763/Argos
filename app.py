@@ -6,7 +6,7 @@ import pandas as pd
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 import gradio as gr
-from duckduckgo_search import DDGS
+from ddgs import DDGS
 import tldextract
 from rapidfuzz import fuzz
 
