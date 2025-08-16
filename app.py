@@ -247,28 +247,34 @@ with gr.Blocks(title="Argos Lead Finder") as demo:
                         download_json = gr.File(label="JSON", interactive=False)
 
     async def do_search(domains_val, keywords_val, extra_val, max_results_val, table):
-        status.update("Running search…")
-        df_new = await search_and_extract(domains_val or "", keywords_val or "", extra_val or "", int(max_results_val or 20))
+        try:
+            df_new = await search_and_extract(domains_val or "", keywords_val or "", extra_val or "", int(max_results_val or 20))
 
-        # Normalize current table to DataFrame
-        if isinstance(table, pd.DataFrame):
-            cur = table
-        elif table is None:
-            cur = pd.DataFrame(columns=df.headers)
-        else:
-            try:
-                cur = pd.DataFrame(table, columns=df.headers)
-            except Exception:
-                cur = pd.DataFrame(table)
+            # Normalize current table to DataFrame
+            if isinstance(table, pd.DataFrame):
+                cur = table
+            elif table is None:
+                cur = pd.DataFrame(columns=DEFAULT_COLUMNS)
+            else:
+                try:
+                    cur = pd.DataFrame(table, columns=DEFAULT_COLUMNS)
+                except Exception:
+                    cur = pd.DataFrame(table)
 
-        if cur.empty:
-            out = df_new
-        else:
-            out = pd.concat([cur, df_new], ignore_index=True, sort=False)
-            out = out.drop_duplicates(subset=["email", "source_url"], keep="first")
+            if cur.empty:
+                out = df_new
+            else:
+                out = pd.concat([cur, df_new], ignore_index=True, sort=False)
+                out = out.drop_duplicates(subset=["email", "source_url"], keep="first")
 
-        status.update(f"Found {len(df_new)} new rows. Total: {len(out)}")
-        return out
+            if len(df_new) == 0:
+                status_msg = "⚠️ No leads found. Try different keywords or domains."
+            else:
+                status_msg = f"✅ Found {len(df_new)} new leads. Total: {len(out)} leads"
+            
+            return out, status_msg
+        except Exception as e:
+            return table if table is not None else pd.DataFrame(columns=DEFAULT_COLUMNS), f"❌ Search failed: {str(e)}"
 
     def add_column(table, name):
         if not name:
@@ -338,7 +344,7 @@ with gr.Blocks(title="Argos Lead Finder") as demo:
         cur.to_json(tmp.name, orient="records", indent=2)
         return tmp.name
 
-    search_btn.click(do_search, inputs=[domains, keywords, extra, max_results, df], outputs=df)
+    search_btn.click(do_search, inputs=[domains, keywords, extra, max_results, df], outputs=[df, status])
     add_col_btn.click(add_column, inputs=[df, add_col_name], outputs=df)
     del_col_btn.click(del_column, inputs=[df, del_col_name], outputs=df)
     add_row_btn.click(add_row, inputs=[df], outputs=df)
