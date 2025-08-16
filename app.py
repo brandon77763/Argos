@@ -30,6 +30,7 @@ SOCIAL_DOMAINS = {
     "tiktok": ["tiktok.com"],
     "youtube": ["youtube.com", "youtu.be"],
     "github": ["github.com"],
+    "craigslist": ["craigslist.org"],
 }
 
 DEFAULT_COLUMNS = [
@@ -43,6 +44,7 @@ DEFAULT_COLUMNS = [
     "tiktok",
     "youtube",
     "github",
+    "craigslist",
     "source_url",
     "source_title",
 ]
@@ -53,7 +55,7 @@ HEADERS = {"User-Agent": USER_AGENT, "Accept-Language": "en-US,en;q=0.9"}
 DB_PATH = "leads.db"
 
 def init_database():
-    """Initialize the SQLite database with the leads table."""
+    """Initialize the SQLite database and create tables."""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
@@ -71,12 +73,21 @@ def init_database():
             tiktok TEXT,
             youtube TEXT,
             github TEXT,
+            craigslist TEXT,
             source_url TEXT,
             source_title TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
+    
+    # Add craigslist column if it doesn't exist (for existing databases)
+    try:
+        cursor.execute('ALTER TABLE leads ADD COLUMN craigslist TEXT')
+        print("Added craigslist column to existing database")
+    except sqlite3.OperationalError:
+        # Column already exists or other error, continue
+        pass
     
     conn.commit()
     conn.close()
@@ -395,34 +406,43 @@ with gr.Blocks(title="Argos Lead Finder") as demo:
                     gr.Markdown("#### Advanced Options")
                     crawler_social_focus = gr.CheckboxGroup(
                         label="Social Platforms to Focus",
-                        choices=["LinkedIn", "Twitter", "GitHub", "AngelList", "Crunchbase"],
+                        choices=["LinkedIn", "Twitter", "GitHub", "AngelList", "Crunchbase", "Craigslist"],
                         value=["LinkedIn", "Twitter"]
                     )
+                    crawler_auto_iterate = gr.Checkbox(label="Auto-Iterate (Find leads, then search for their contacts)", value=True)
+                    crawler_continuous = gr.Checkbox(label="Continuous Mode (Never stop crawling)", value=False)
                     crawler_depth = gr.Slider(1, 10, value=3, step=1, label="Crawl Depth")
-                    crawler_delay = gr.Slider(1, 30, value=5, step=1, label="Delay Between Requests (seconds)")
+                    crawler_delay = gr.Slider(5, 120, value=30, step=5, label="Delay Between Searches (seconds)")
                     crawler_max_per_domain = gr.Slider(10, 500, value=100, step=10, label="Max Results Per Domain")
             
             with gr.Row():
-                crawler_start_btn = gr.Button("🚀 Start Auto Crawler", variant="primary", size="lg")
+                crawler_start_btn = gr.Button("🚀 Start Smart Crawler", variant="primary", size="lg")
                 crawler_stop_btn = gr.Button("🛑 Stop Crawler", variant="secondary")
                 crawler_status = gr.Markdown("Status: **Ready**")
+                crawler_refresh_btn = gr.Button("🔄 Refresh Status", variant="secondary", size="sm")
             
             with gr.Row():
                 with gr.Column():
                     crawler_console = gr.Textbox(
-                        label="Crawler Activity Log",
-                        placeholder="Crawler activity will appear here...",
+                        label="Live Crawler Activity",
+                        placeholder="Smart crawler activity will appear here...",
                         lines=15,
                         max_lines=20,
                         interactive=False,
                         show_copy_button=True
                     )
                 with gr.Column():
-                    crawler_stats = gr.Markdown("### Statistics\n- **Total Searches:** 0\n- **Domains Found:** 0\n- **Contacts Found:** 0\n- **Success Rate:** 0%")
+                    crawler_stats = gr.Markdown("### Live Statistics\n- **Status:** Idle\n- **Total Searches:** 0\n- **Domains Found:** 0\n- **Contacts Found:** 0\n- **Success Rate:** 0%\n- **Next Action:** Waiting to start")
                     crawler_queue = gr.Textbox(
-                        label="Current Search Queue",
-                        placeholder="Queued searches will appear here...",
+                        label="Smart Search Queue",
+                        placeholder="Intelligent search queue will appear here...",
                         lines=8,
+                        interactive=False
+                    )
+                    crawler_insights = gr.Textbox(
+                        label="Crawler Insights",
+                        placeholder="AI insights and discoveries will appear here...",
+                        lines=6,
                         interactive=False
                     )
 
@@ -442,7 +462,7 @@ with gr.Blocks(title="Argos Lead Finder") as demo:
             **Features:**
             - **Industry Targeting**: Focuses searches on specific industries
             - **Role-Based Discovery**: Targets CEOs, CTOs, VPs, etc.
-            - **Social Platform Integration**: LinkedIn, Twitter, GitHub crawling
+            - **Social Platform Integration**: LinkedIn, Twitter, GitHub, Craigslist crawling
             - **Intelligent Queuing**: Generates 50+ search strategies automatically
             - **Rate Limiting**: Respects website policies with configurable delays
             - **Real-time Monitoring**: Live stats and activity logging
@@ -454,6 +474,8 @@ with gr.Blocks(title="Argos Lead Finder") as demo:
             - Podcast guest bio mining
             - Press release contact harvesting
             - About us page team extraction
+            - Craigslist business services and job postings
+            - Local business owner discovery via Craigslist
             
             ### 📊 Database Features
             - **Auto-save**: All data automatically saved to SQLite database
@@ -469,40 +491,274 @@ with gr.Blocks(title="Argos Lead Finder") as demo:
             - Use appropriate delays in auto crawler to avoid rate limiting
             """)
 
-    # Auto Crawler Functions
+    # Smart Auto Crawler Functions
     crawler_active = gr.State(False)
     crawler_queue_list = gr.State([])
+    crawler_iteration_count = gr.State(0)
     
-    async def start_auto_crawler(industry, location, company_size, role_types, social_focus, depth, delay, max_per_domain):
-        """Start the auto crawler with advanced search strategies"""
+    async def smart_crawler_engine(industry, location, company_size, role_types, social_focus, auto_iterate, continuous, depth, delay, max_per_domain, current_df):
+        """Intelligent self-iterating crawler that learns and adapts"""
         
         def log_crawler(msg):
             timestamp = pd.Timestamp.now().strftime("%H:%M:%S")
             return f"[{timestamp}] {msg}"
         
-        crawler_log = log_crawler("🚀 Auto Crawler Starting...")
+        def update_insights(insights):
+            return insights
+        
+        # Initialize working state
+        if isinstance(current_df, pd.DataFrame):
+            working_df = current_df.copy()
+        elif current_df is None:
+            working_df = pd.DataFrame(columns=DEFAULT_COLUMNS)
+        else:
+            try:
+                working_df = pd.DataFrame(current_df, columns=DEFAULT_COLUMNS)
+            except Exception:
+                working_df = pd.DataFrame(current_df)
+        
+        initial_count = len(working_df)
+        iteration = 0
+        total_new_contacts = 0
+        total_domains = set()
+        successful_searches = 0
+        total_searches = 0
+        
+        crawler_log = log_crawler("🧠 Smart Crawler Engine Starting...")
+        crawler_log += "\n" + log_crawler(f"📊 Starting with {initial_count} existing contacts")
+        
+        insights = "🤖 Initializing AI crawler...\n"
+        
+        while True:
+            iteration += 1
+            crawler_log += "\n" + log_crawler(f"🔄 Starting iteration #{iteration}")
+            
+            # Generate adaptive strategies based on current data
+            if iteration == 1:
+                # First iteration: use user inputs
+                strategies = generate_crawler_strategies(industry, location, company_size, role_types, social_focus)
+                insights += f"📋 Generated {len(strategies)} initial strategies\n"
+            else:
+                # Subsequent iterations: learn from existing data
+                strategies = generate_adaptive_strategies(working_df, industry, location, social_focus, depth)
+                insights += f"🎯 Generated {len(strategies)} adaptive strategies from existing {len(working_df)} contacts\n"
+            
+            crawler_log += "\n" + log_crawler(f"📋 Generated {len(strategies)} strategies for iteration #{iteration}")
+            
+            # Execute strategies for this iteration
+            iteration_new_contacts = 0
+            iteration_searches = 0
+            
+            for i, strategy in enumerate(strategies[:5]):  # Limit per iteration
+                iteration_searches += 1
+                total_searches += 1
+                
+                crawler_log += "\n" + log_crawler(f"🔍 [{iteration}.{i+1}] {strategy['name']}")
+                
+                # Update live stats
+                stats_text = f"""### Live Statistics
+- **Status:** Running (Iteration {iteration})
+- **Total Searches:** {total_searches}
+- **Domains Found:** {len(total_domains)}
+- **Total Contacts:** {len(working_df)}
+- **New This Iteration:** {iteration_new_contacts}
+- **Success Rate:** {(successful_searches / max(total_searches, 1)) * 100:.1f}%
+- **Next Action:** {strategy['name'][:50]}..."""
+                
+                queue_text = f"Current Iteration: {iteration}\n"
+                queue_text += f"Strategy {i+1}/{len(strategies[:5])}: {strategy['name']}\n"
+                queue_text += f"Remaining: {len(strategies[:5]) - i - 1} searches\n"
+                if continuous:
+                    queue_text += f"Mode: Continuous (will restart after completion)"
+                else:
+                    queue_text += f"Mode: Single run"
+                
+                # Yield live update
+                yield (
+                    True,  # crawler_active
+                    "Status: **Running** 🟢",  # crawler_status
+                    crawler_log,  # crawler_console
+                    stats_text,  # crawler_stats
+                    queue_text,  # crawler_queue
+                    strategies,  # crawler_queue_list
+                    working_df,  # updated dataframe
+                    insights  # crawler_insights
+                )
+                
+                try:
+                    # Execute search
+                    df_results = await search_and_extract("", strategy['query'], "", max_per_domain)
+                    
+                    if not df_results.empty:
+                        # Merge results
+                        before_merge = len(working_df)
+                        working_df = pd.concat([working_df, df_results], ignore_index=True, sort=False)
+                        working_df = working_df.drop_duplicates(subset=["email", "source_url"], keep="first")
+                        after_merge = len(working_df)
+                        
+                        contacts_found = after_merge - before_merge
+                        iteration_new_contacts += contacts_found
+                        total_new_contacts += contacts_found
+                        successful_searches += 1
+                        
+                        # Extract domains
+                        for url in df_results['source_url'].dropna():
+                            try:
+                                parts = tldextract.extract(url)
+                                domain = f"{parts.domain}.{parts.suffix}".lower()
+                                if domain:
+                                    total_domains.add(domain)
+                            except:
+                                pass
+                        
+                        crawler_log += "\n" + log_crawler(f"✅ Found {contacts_found} new contacts")
+                        
+                        # Update insights with discoveries
+                        if contacts_found > 0:
+                            insights += f"🎯 {strategy['type']}: Found {contacts_found} contacts\n"
+                            
+                            # Analyze what worked
+                            if "linkedin" in strategy['query'].lower() and contacts_found > 3:
+                                insights += "💡 LinkedIn searches highly effective\n"
+                            if "startup" in strategy['query'].lower() and contacts_found > 2:
+                                insights += "💡 Startup-focused queries working well\n"
+                    else:
+                        crawler_log += "\n" + log_crawler(f"❌ No results from {strategy['name']}")
+                    
+                    # Save progress after each search
+                    save_leads_to_db(working_df)
+                    
+                    # Intelligent delay based on success rate
+                    adaptive_delay = delay
+                    if successful_searches / max(total_searches, 1) > 0.8:
+                        adaptive_delay = max(delay // 2, 15)  # Speed up if very successful
+                    elif successful_searches / max(total_searches, 1) < 0.3:
+                        adaptive_delay = delay * 2  # Slow down if struggling
+                    
+                    crawler_log += "\n" + log_crawler(f"⏱️ Adaptive delay: {adaptive_delay}s (success rate: {(successful_searches / max(total_searches, 1)) * 100:.1f}%)")
+                    await asyncio.sleep(adaptive_delay)
+                    
+                except Exception as e:
+                    crawler_log += "\n" + log_crawler(f"❌ Error in {strategy['name']}: {str(e)}")
+            
+            # End of iteration summary
+            crawler_log += "\n" + log_crawler(f"📊 Iteration #{iteration} complete: {iteration_new_contacts} new contacts")
+            insights += f"📊 Iteration {iteration}: +{iteration_new_contacts} contacts\n"
+            
+            # Decide whether to continue
+            if not continuous:
+                break
+            
+            if auto_iterate and iteration_new_contacts == 0 and iteration > 3:
+                crawler_log += "\n" + log_crawler("🛑 No new contacts found in recent iterations, stopping")
+                insights += "🛑 Auto-stopped: No new discoveries\n"
+                break
+            
+            if iteration >= 10:  # Safety limit
+                crawler_log += "\n" + log_crawler("🛑 Reached maximum iterations (10), stopping")
+                insights += "🛑 Reached iteration limit\n"
+                break
+            
+            # Prepare for next iteration
+            if continuous or (auto_iterate and iteration_new_contacts > 0):
+                crawler_log += "\n" + log_crawler(f"🔄 Preparing iteration #{iteration + 1}...")
+                insights += f"🔄 Planning iteration {iteration + 1}...\n"
+                await asyncio.sleep(30)  # Brief pause between iterations
+        
+        # Final summary
+        crawler_log += "\n" + log_crawler("🎉 Smart Crawler completed!")
+        crawler_log += "\n" + log_crawler(f"📊 Final: {total_new_contacts} new contacts across {iteration} iterations")
+        
+        final_stats = f"""### Final Statistics
+- **Status:** Completed
+- **Total Iterations:** {iteration}
+- **Total Searches:** {total_searches}
+- **Domains Found:** {len(total_domains)}
+- **New Contacts Found:** {total_new_contacts}
+- **Total Contacts:** {len(working_df)}
+- **Success Rate:** {(successful_searches / max(total_searches, 1)) * 100:.1f}%"""
+        
+        insights += f"🏆 Campaign completed: {total_new_contacts} total new contacts found\n"
+        
+        yield (
+            False,  # crawler_active
+            "Status: **Completed** ✅",  # crawler_status
+            crawler_log,  # crawler_console
+            final_stats,  # crawler_stats
+            "All iterations completed",  # crawler_queue
+            strategies,  # crawler_queue_list
+            working_df,  # final dataframe
+            insights  # final insights
+        )
+        """Start the auto crawler with live updates"""
+        
+        def log_crawler(msg):
+            timestamp = pd.Timestamp.now().strftime("%H:%M:%S")
+            return f"[{timestamp}] {msg}"
+        
+        # Initialize the working dataframe with current data
+        if isinstance(current_df, pd.DataFrame):
+            working_df = current_df.copy()
+        elif current_df is None:
+            working_df = pd.DataFrame(columns=DEFAULT_COLUMNS)
+        else:
+            try:
+                working_df = pd.DataFrame(current_df, columns=DEFAULT_COLUMNS)
+            except Exception:
+                working_df = pd.DataFrame(current_df)
+        
+        initial_count = len(working_df)
         
         # Generate search strategies
         strategies = generate_crawler_strategies(industry, location, company_size, role_types, social_focus)
-        crawler_log += "\n" + log_crawler(f"📋 Generated {len(strategies)} search strategies")
         
-        # Start executing strategies
-        total_contacts = 0
+        # Initialize progress tracking
+        crawler_log = log_crawler("🚀 Auto Crawler Starting...")
+        crawler_log += "\n" + log_crawler(f"� Starting with {initial_count} existing contacts")
+        crawler_log += "\n" + log_crawler(f"�📋 Generated {len(strategies)} search strategies")
+        
+        total_new_contacts = 0
         total_domains = set()
         successful_searches = 0
         
+        # Yield initial state
+        yield (
+            True,  # crawler_active
+            "Status: **Running** 🟢",  # crawler_status
+            crawler_log,  # crawler_console
+            f"### Statistics\n- **Total Searches:** 0/{len(strategies)}\n- **Domains Found:** 0\n- **New Contacts Found:** 0\n- **Total Contacts:** {len(working_df)}\n- **Success Rate:** 0%",  # crawler_stats
+            "\n".join([f"• {s['name']}" for s in strategies[:10]]) + (f"\n... and {len(strategies) - 10} more" if len(strategies) > 10 else ""),  # crawler_queue
+            strategies,  # crawler_queue_list
+            working_df  # updated dataframe
+        )
+        
         for i, strategy in enumerate(strategies[:10]):  # Limit for demo
             crawler_log += "\n" + log_crawler(f"🔍 Executing: {strategy['name']}")
+            
+            # Yield progress update
+            yield (
+                True,
+                "Status: **Running** 🟢",
+                crawler_log,
+                f"### Statistics\n- **Total Searches:** {i}/{len(strategies)}\n- **Domains Found:** {len(total_domains)}\n- **New Contacts Found:** {total_new_contacts}\n- **Total Contacts:** {len(working_df)}\n- **Success Rate:** {(successful_searches / max(i, 1)) * 100:.1f}%",
+                "\n".join([f"• {s['name']}" for s in strategies[i:i+10]]) + (f"\n... and {len(strategies) - i - 10} more" if len(strategies) > i + 10 else ""),
+                strategies,
+                working_df
+            )
             
             try:
                 # Use the existing search function with the strategy query
                 df_results = await search_and_extract("", strategy['query'], "", max_per_domain)
                 
                 if not df_results.empty:
-                    # Save results to database
-                    save_leads_to_db(df_results)
-                    contacts_found = len(df_results)
-                    total_contacts += contacts_found
+                    # Merge with working dataframe
+                    before_merge = len(working_df)
+                    working_df = pd.concat([working_df, df_results], ignore_index=True, sort=False)
+                    working_df = working_df.drop_duplicates(subset=["email", "source_url"], keep="first")
+                    after_merge = len(working_df)
+                    
+                    contacts_found = after_merge - before_merge
+                    total_new_contacts += contacts_found
                     successful_searches += 1
                     
                     # Extract domains
@@ -515,16 +771,17 @@ with gr.Blocks(title="Argos Lead Finder") as demo:
                         except:
                             pass
                     
-                    crawler_log += "\n" + log_crawler(f"✅ Found {contacts_found} contacts from {strategy['name']}")
+                    crawler_log += "\n" + log_crawler(f"✅ Found {contacts_found} new contacts from {strategy['name']}")
                 else:
                     crawler_log += "\n" + log_crawler(f"❌ No results from {strategy['name']}")
                 
-                # Update statistics
+                # Update statistics after each search
                 success_rate = (successful_searches / (i + 1)) * 100
                 stats_text = f"""### Statistics
 - **Total Searches:** {i + 1}/{len(strategies)}
 - **Domains Found:** {len(total_domains)}
-- **Contacts Found:** {total_contacts}
+- **New Contacts Found:** {total_new_contacts}
+- **Total Contacts:** {len(working_df)}
 - **Success Rate:** {success_rate:.1f}%"""
                 
                 # Update queue
@@ -533,55 +790,316 @@ with gr.Blocks(title="Argos Lead Finder") as demo:
                 if len(strategies) > i + 11:
                     queue_text += f"\n... and {len(strategies) - i - 11} more"
                 
+                # Yield live update
+                yield (
+                    True,
+                    "Status: **Running** 🟢",
+                    crawler_log,
+                    stats_text,
+                    queue_text,
+                    strategies,
+                    working_df
+                )
+                
+                # Save intermediate results to database
+                save_leads_to_db(working_df)
+                
                 # Simulate delay
                 if delay > 0 and i < len(strategies) - 1:
                     crawler_log += "\n" + log_crawler(f"⏱️ Waiting {delay} seconds before next search...")
+                    yield (
+                        True,
+                        "Status: **Running** 🟢",
+                        crawler_log,
+                        stats_text,
+                        queue_text,
+                        strategies,
+                        working_df
+                    )
                     await asyncio.sleep(delay)
                 
             except Exception as e:
                 crawler_log += "\n" + log_crawler(f"❌ Error in {strategy['name']}: {str(e)}")
+                yield (
+                    True,
+                    "Status: **Running** 🟢",
+                    crawler_log,
+                    stats_text,
+                    queue_text,
+                    strategies,
+                    working_df
+                )
         
+        # Final update
         crawler_log += "\n" + log_crawler("🎉 Auto Crawler completed!")
+        crawler_log += "\n" + log_crawler(f"💾 Updated database with {len(working_df)} total contacts")
+        
         final_stats = f"""### Final Statistics
 - **Total Searches:** {len(strategies)}
 - **Domains Found:** {len(total_domains)}
-- **Contacts Found:** {total_contacts}
+- **New Contacts Found:** {total_new_contacts}
+- **Total Contacts:** {len(working_df)}
 - **Success Rate:** {(successful_searches / len(strategies)) * 100:.1f}%"""
         
-        return True, "Status: **Completed** ✅", crawler_log, final_stats, "All searches completed", strategies
+        yield (
+            False,  # crawler stops
+            "Status: **Completed** ✅",
+            crawler_log,
+            final_stats,
+            "All searches completed",
+            strategies,
+            working_df
+        )
     
-    def stop_auto_crawler():
+    async def start_auto_crawler_simple(industry, location, company_size, role_types, social_focus, depth, delay, max_per_domain, current_df):
+        """Simple auto crawler with immediate updates"""
+        
+        def log_crawler(msg):
+            timestamp = pd.Timestamp.now().strftime("%H:%M:%S")
+            return f"[{timestamp}] {msg}"
+        
+        # Initialize the working dataframe with current data
+        if isinstance(current_df, pd.DataFrame):
+            working_df = current_df.copy()
+        elif current_df is None:
+            working_df = pd.DataFrame(columns=DEFAULT_COLUMNS)
+        else:
+            try:
+                working_df = pd.DataFrame(current_df, columns=DEFAULT_COLUMNS)
+            except Exception:
+                working_df = pd.DataFrame(current_df)
+        
+        initial_count = len(working_df)
+        
+        # Generate search strategies
+        strategies = generate_crawler_strategies(industry, location, company_size, role_types, social_focus)
+        
+        # Build initial log
+        crawler_log = log_crawler("🚀 Auto Crawler Starting...")
+        crawler_log += "\n" + log_crawler(f"📊 Starting with {initial_count} existing contacts")
+        crawler_log += "\n" + log_crawler(f"📋 Generated {len(strategies)} search strategies")
+        
+        total_new_contacts = 0
+        total_domains = set()
+        successful_searches = 0
+        iteration_count = 0
+        max_iterations = 3  # Allow multiple learning cycles
+        
+        # Multi-iteration learning loop
+        for iteration in range(max_iterations):
+            iteration_count += 1
+            crawler_log += "\n" + log_crawler(f"🔄 === ITERATION {iteration + 1} ===")
+            
+            # Generate adaptive strategies based on current data
+            if iteration > 0:
+                adaptive_strategies = generate_adaptive_strategies(working_df, industry, location)
+                strategies.extend(adaptive_strategies)
+                crawler_log += "\n" + log_crawler(f"🧠 Generated {len(adaptive_strategies)} adaptive strategies from existing data")
+            
+            current_strategies = strategies[iteration * 5:(iteration + 1) * 5]  # 5 strategies per iteration
+            
+            for i, strategy in enumerate(current_strategies):
+                overall_index = iteration * 5 + i
+                crawler_log += "\n" + log_crawler(f"🔍 [{iteration+1}.{i+1}] Executing: {strategy['name']}")
+                
+                try:
+                    # Use the existing search function with the strategy query
+                    df_results = await search_and_extract("", strategy['query'], "", max_per_domain, 
+                                                          progress_callback=lambda msg: None)  # Disable internal logging for cleaner output
+                    
+                    if not df_results.empty:
+                        # Merge with working dataframe
+                        before_merge = len(working_df)
+                        working_df = pd.concat([working_df, df_results], ignore_index=True, sort=False)
+                        working_df = working_df.drop_duplicates(subset=["email", "source_url"], keep="first")
+                        after_merge = len(working_df)
+                        
+                        contacts_found = after_merge - before_merge
+                        total_new_contacts += contacts_found
+                        successful_searches += 1
+                        
+                        # Extract domains for learning
+                        new_domains = set()
+                        for url in df_results['source_url'].dropna():
+                            try:
+                                parts = tldextract.extract(url)
+                                domain = f"{parts.domain}.{parts.suffix}".lower()
+                                if domain:
+                                    total_domains.add(domain)
+                                    new_domains.add(domain)
+                            except:
+                                pass
+                        
+                        crawler_log += "\n" + log_crawler(f"✅ Found {contacts_found} new contacts from {strategy['name']}")
+                        if new_domains:
+                            crawler_log += "\n" + log_crawler(f"📍 New domains discovered: {', '.join(list(new_domains)[:3])}")
+                    else:
+                        crawler_log += "\n" + log_crawler(f"❌ No results from {strategy['name']}")
+                    
+                    # Save intermediate results to database after each successful search
+                    if not df_results.empty:
+                        save_leads_to_db(working_df)
+                        crawler_log += "\n" + log_crawler("💾 Auto-saved progress to database")
+                    
+                    # Smart delay based on success rate
+                    current_success_rate = (successful_searches / max(overall_index + 1, 1)) * 100
+                    adaptive_delay = max(1, delay - int(current_success_rate / 20))  # Reduce delay for successful crawls
+                    
+                    if adaptive_delay > 0 and i < len(current_strategies) - 1:
+                        crawler_log += "\n" + log_crawler(f"⏱️ Smart delay: {adaptive_delay}s (success rate: {current_success_rate:.1f}%)")
+                        await asyncio.sleep(adaptive_delay)
+                    
+                except Exception as e:
+                    crawler_log += "\n" + log_crawler(f"❌ Error in {strategy['name']}: {str(e)}")
+            
+            # Check if we should continue iterating
+            if iteration < max_iterations - 1:
+                crawler_log += "\n" + log_crawler(f"📊 Iteration {iteration + 1} complete. Analyzing data for next iteration...")
+                
+                # Only continue if we're finding new contacts
+                if total_new_contacts == 0 and iteration > 0:
+                    crawler_log += "\n" + log_crawler("🛑 No new contacts found. Stopping iterations.")
+                    break
+        
+        # Final update
+        crawler_log += "\n" + log_crawler("🎉 Smart Crawler completed all iterations!")
+        crawler_log += "\n" + log_crawler(f"💾 Final save: {len(working_df)} total contacts in database")
+        
+        final_stats = f"""### Final Statistics
+- **Iterations Completed:** {iteration_count}
+- **Total Searches:** {successful_searches}
+- **Domains Found:** {len(total_domains)}
+- **New Contacts Found:** {total_new_contacts}
+- **Total Contacts:** {len(working_df)}
+- **Success Rate:** {(successful_searches / max(len(strategies), 1)) * 100:.1f}%"""
+        
+        return (
+            False,  # crawler stops
+            "Status: **Completed** ✅",
+            crawler_log,
+            final_stats,
+            "All searches completed",
+            strategies,
+            working_df
+        )
+    
+    def stop_auto_crawler(current_df):
         """Stop the auto crawler"""
-        return False, "Status: **Stopped** 🔴", "", "### Statistics\n- **Total Searches:** 0\n- **Domains Found:** 0\n- **Contacts Found:** 0\n- **Success Rate:** 0%", ""
+        return False, "Status: **Stopped** 🔴", "", "### Statistics\n- **Total Searches:** 0\n- **Domains Found:** 0\n- **Contacts Found:** 0\n- **Success Rate:** 0%", "", current_df, ""
+    
+    def generate_adaptive_strategies(existing_df, industry, location, social_focus, depth):
+        """Generate new strategies based on existing contact data"""
+        strategies = []
+        
+        if existing_df.empty:
+            return generate_crawler_strategies(industry, location, [], [], social_focus)
+        
+        # Analyze existing data for patterns
+        domains_found = []
+        companies_found = []
+        
+        for url in existing_df['source_url'].dropna():
+            try:
+                parts = tldextract.extract(url)
+                domain = f"{parts.domain}.{parts.suffix}".lower()
+                if domain and domain not in ['linkedin.com', 'twitter.com', 'github.com']:
+                    domains_found.append(domain)
+            except:
+                pass
+        
+        # Extract company names from titles and URLs
+        for title in existing_df['source_title'].dropna():
+            # Simple company name extraction
+            words = title.split()
+            for word in words:
+                if len(word) > 3 and word.istitle():
+                    companies_found.append(word)
+        
+        # Generate adaptive strategies
+        unique_domains = list(set(domains_found))[:10]
+        unique_companies = list(set(companies_found))[:10]
+        
+        # Search competitors/similar companies
+        for company in unique_companies[:5]:
+            strategies.extend([
+                {"name": f"Competitors of {company}", "type": "competitor_search", "query": f"competitors {company} CEO founder contact"},
+                {"name": f"Partners of {company}", "type": "partner_search", "query": f"partners {company} {industry} contact"},
+                {"name": f"Clients of {company}", "type": "client_search", "query": f"clients customers {company} testimonial contact"},
+            ])
+        
+        # Explore similar domains
+        for domain in unique_domains[:5]:
+            strategies.extend([
+                {"name": f"Similar to {domain}", "type": "similar_domain", "query": f"similar {domain} {industry} company contact"},
+                {"name": f"About pages like {domain}", "type": "about_pattern", "query": f"site:{domain} about team contact"},
+            ])
+        
+        # Industry expansion based on found patterns
+        if len(existing_df) > 20:  # Enough data to analyze
+            strategies.extend([
+                {"name": "Industry conference speakers", "type": "conference_expansion", "query": f"{industry} conference 2024 2025 speaker contact"},
+                {"name": "Industry investors", "type": "investor_search", "query": f"{industry} investor VC partner contact"},
+                {"name": "Industry advisors", "type": "advisor_search", "query": f"{industry} advisor consultant expert contact"},
+            ])
+        
+        # Social expansion
+        if "LinkedIn" in social_focus:
+            strategies.append({"name": "LinkedIn company connections", "type": "linkedin_expansion", "query": f"site:linkedin.com/company {industry} {location}"})
+        
+        return strategies[:20]  # Limit adaptive strategies
     
     def generate_crawler_strategies(industry, location, company_size, role_types, social_focus):
         """Generate advanced search strategies based on user inputs"""
         strategies = []
         
+        # Use fallback terms if no industry specified
+        industry_terms = industry if industry else "business CEO founder contact"
+        location_terms = location if location else "contact email phone"
+        
         # Industry-specific searches
-        if industry:
-            strategies.extend([
-                {"name": f"{industry} companies {location}", "type": "company_discovery", "query": f"site:linkedin.com/company {industry} {location}"},
-                {"name": f"{industry} startups", "type": "startup_discovery", "query": f"{industry} startup founders contact"},
-                {"name": f"{industry} news mentions", "type": "news_crawl", "query": f"{industry} CEO CTO contact email"},
-            ])
+        strategies.extend([
+            {"name": f"{industry_terms} companies {location_terms}", "type": "company_discovery", "query": f"site:linkedin.com/company {industry_terms} {location_terms}"},
+            {"name": f"{industry_terms} startups", "type": "startup_discovery", "query": f"{industry_terms} startup founders contact"},
+            {"name": f"{industry_terms} news mentions", "type": "news_crawl", "query": f"{industry_terms} CEO CTO contact email"},
+        ])
         
         # Role-based searches
-        for role in role_types:
+        if role_types:
+            for role in role_types:
+                strategies.extend([
+                    {"name": f"{role} at {industry_terms} companies", "type": "role_search", "query": f"site:linkedin.com/in {role} {industry_terms} {location_terms}"},
+                    {"name": f"{role} contact pages", "type": "contact_discovery", "query": f"{role} {industry_terms} contact email phone"},
+                ])
+        else:
+            # Default role searches if none specified
             strategies.extend([
-                {"name": f"{role} at {industry} companies", "type": "role_search", "query": f"site:linkedin.com/in {role} {industry} {location}"},
-                {"name": f"{role} contact pages", "type": "contact_discovery", "query": f"{role} {industry} contact email phone"},
+                {"name": "CEO contact pages", "type": "contact_discovery", "query": f"CEO {industry_terms} contact email phone"},
+                {"name": "Founder contact pages", "type": "contact_discovery", "query": f"founder {industry_terms} contact email phone"},
             ])
         
         # Social platform specific searches
         if "LinkedIn" in social_focus:
-            strategies.append({"name": "LinkedIn company pages", "type": "linkedin_crawl", "query": f"site:linkedin.com/company {industry}"})
+            strategies.append({"name": "LinkedIn company pages", "type": "linkedin_crawl", "query": f"site:linkedin.com/company {industry_terms}"})
         
         if "Twitter" in social_focus:
-            strategies.append({"name": "Twitter profiles", "type": "twitter_crawl", "query": f"site:twitter.com {industry} CEO founder"})
+            strategies.append({"name": "Twitter profiles", "type": "twitter_crawl", "query": f"site:twitter.com {industry_terms} CEO founder"})
         
         if "GitHub" in social_focus:
-            strategies.append({"name": "GitHub developer profiles", "type": "github_crawl", "query": f"site:github.com {industry} developer contact"})
+            strategies.append({"name": "GitHub developer profiles", "type": "github_crawl", "query": f"site:github.com {industry_terms} developer contact"})
+        
+        if "Craigslist" in social_focus:
+            strategies.extend([
+                {"name": "Craigslist services", "type": "craigslist_services", "query": f"site:craigslist.org {industry_terms} services contact"},
+                {"name": "Craigslist jobs", "type": "craigslist_jobs", "query": f"site:craigslist.org {industry_terms} jobs hiring {location_terms}"},
+                {"name": "Craigslist business services", "type": "craigslist_biz", "query": f"site:craigslist.org 'business services' {industry_terms} {location_terms}"},
+                {"name": "Craigslist for sale by owner", "type": "craigslist_fsbo", "query": f"site:craigslist.org 'for sale' {industry_terms} business owner contact"},
+            ])
+        
+        if "AngelList" in social_focus:
+            strategies.append({"name": "AngelList startups", "type": "angellist_crawl", "query": f"site:angel.co {industry_terms} startup founder"})
+        
+        if "Crunchbase" in social_focus:
+            strategies.append({"name": "Crunchbase companies", "type": "crunchbase_crawl", "query": f"site:crunchbase.com {industry_terms} company founder CEO"})
         
         # Advanced search patterns
         strategies.extend([
@@ -739,17 +1257,29 @@ with gr.Blocks(title="Argos Lead Finder") as demo:
             save_leads_to_db(df_data)
         return data
 
-    # Auto Crawler Event Handlers
+    # Smart Crawler Event Handlers
     crawler_start_btn.click(
-        start_auto_crawler,
+        smart_crawler_engine,
         inputs=[crawler_industry, crawler_location, crawler_company_size, crawler_role_types, 
-                crawler_social_focus, crawler_depth, crawler_delay, crawler_max_per_domain],
-        outputs=[crawler_active, crawler_status, crawler_console, crawler_stats, crawler_queue, crawler_queue_list]
+                crawler_social_focus, crawler_auto_iterate, crawler_continuous, crawler_depth, crawler_delay, crawler_max_per_domain, df],
+        outputs=[crawler_active, crawler_status, crawler_console, crawler_stats, crawler_queue, crawler_queue_list, df, crawler_insights],
+        show_progress=True
     )
     
     crawler_stop_btn.click(
         stop_auto_crawler,
-        outputs=[crawler_active, crawler_status, crawler_console, crawler_stats, crawler_queue]
+        inputs=[df],
+        outputs=[crawler_active, crawler_status, crawler_console, crawler_stats, crawler_queue, df, crawler_insights]
+    )
+    
+    def refresh_crawler_status():
+        """Refresh the crawler display with current database data"""
+        current_data = load_leads_from_db()
+        return current_data
+    
+    crawler_refresh_btn.click(
+        refresh_crawler_status,
+        outputs=[df]
     )
 
     # Regular Event Handlers
