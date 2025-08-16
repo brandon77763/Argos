@@ -12,6 +12,12 @@ ENV/
 env/
 .env/
 
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+leads.db
+
 # Pip/Poetry dependency files (keep requirements.txt but not the installed packages)
 pip-log.txt
 pip-delete-this-directory.txt
