@@ -1,0 +1,6 @@
+gradio>=4.36.1
+pandas>=2.2.2
+httpx>=0.27.0
+beautifulsoup4>=4.12.3
+ddgs>=9.5.2
+tldextract>=5.1.2

@@ -89,6 +89,24 @@ def init_database():
         # Column already exists or other error, continue
         pass
     
+    # Create URL tracking table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS scanned_urls (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            url TEXT UNIQUE NOT NULL,
+            domain TEXT NOT NULL,
+            scan_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            contacts_found INTEGER DEFAULT 0,
+            scan_type TEXT DEFAULT 'manual',
+            last_scan TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    # Create index for faster URL lookups
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_url ON scanned_urls(url)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_domain ON scanned_urls(domain)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_last_scan ON scanned_urls(last_scan)')
+    
     conn.commit()
     conn.close()
 
@@ -111,12 +129,97 @@ def save_leads_to_db(df):
         
         cursor.execute('''
             INSERT INTO leads (name, email, phone, linkedin, twitter, facebook, 
-                             instagram, tiktok, youtube, github, source_url, source_title)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                             instagram, tiktok, youtube, github, craigslist, source_url, source_title)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', values)
     
     conn.commit()
     conn.close()
+
+def update_lead_count(df_data):
+    """Update lead count display"""
+    if df_data is None or len(df_data) == 0:
+        count = 0
+    else:
+        count = len(df_data)
+    return f"<div style='text-align: right; font-size: 18px; font-weight: bold; color: #2563eb;'>📊 Total Leads: {count}</div>"
+
+def get_current_lead_count():
+    """Get current lead count from database"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute('SELECT COUNT(*) FROM leads')
+        count = cursor.fetchone()[0]
+        conn.close()
+        return count
+    except Exception:
+        return 0
+
+def is_url_recently_scanned(url, days=7):
+    """Check if URL was scanned within the last N days"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT COUNT(*) FROM scanned_urls 
+            WHERE url = ? AND last_scan > datetime('now', '-{} days')
+        '''.format(days), (url,))
+        count = cursor.fetchone()[0]
+        conn.close()
+        return count > 0
+    except Exception:
+        return False
+
+def record_url_scan(url, contacts_found=0, scan_type='manual'):
+    """Record that a URL has been scanned"""
+    try:
+        import tldextract
+        parsed = tldextract.extract(url)
+        domain = f"{parsed.domain}.{parsed.suffix}".lower()
+        
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT OR REPLACE INTO scanned_urls (url, domain, contacts_found, scan_type, last_scan)
+            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ''', (url, domain, contacts_found, scan_type))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"Error recording URL scan: {e}")
+
+def get_scanned_urls():
+    """Get all scanned URLs with their details"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT url, domain, scan_date, contacts_found, scan_type, last_scan
+            FROM scanned_urls
+            ORDER BY last_scan DESC
+        ''')
+        results = cursor.fetchall()
+        conn.close()
+        return results
+    except Exception:
+        return []
+
+def clear_old_url_records(days=30):
+    """Clear URL records older than N days"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute('''
+            DELETE FROM scanned_urls 
+            WHERE last_scan < datetime('now', '-{} days')
+        '''.format(days))
+        deleted = cursor.rowcount
+        conn.commit()
+        conn.close()
+        return deleted
+    except Exception:
+        return 0
 
 def load_leads_from_db():
     """Load leads from the database into a dataframe."""
@@ -180,6 +283,10 @@ def parse_contacts(url: str, html: str) -> dict:
     title = soup.title.text.strip() if soup.title and soup.title.text else ""
     out["source_title"] = title
 
+    # Special handling for Craigslist posts
+    if "craigslist.org" in url:
+        return parse_craigslist_post(url, soup, out)
+
     text = soup.get_text(" ", strip=True)
     emails = list(dict.fromkeys(EMAIL_RE.findall(text)))
     phones = list(dict.fromkeys(PHONE_RE.findall(text)))
@@ -197,6 +304,75 @@ def parse_contacts(url: str, html: str) -> dict:
             if not cur or len(norm) < len(cur):
                 out[kind] = norm
 
+    return out
+
+
+def parse_craigslist_post(url: str, soup: BeautifulSoup, out: dict) -> dict:
+    """Enhanced parsing for Craigslist posts"""
+    
+    # Get the main post content
+    post_body = soup.find("section", {"id": "postingbody"})
+    if not post_body:
+        post_body = soup.find("div", class_="postingbody")
+    
+    # Get all text content
+    if post_body:
+        text_content = post_body.get_text(" ", strip=True)
+    else:
+        text_content = soup.get_text(" ", strip=True)
+    
+    # Extract emails with enhanced patterns for Craigslist
+    emails = list(dict.fromkeys(EMAIL_RE.findall(text_content)))
+    
+    # Extract phone numbers with enhanced patterns
+    phones = list(dict.fromkeys(PHONE_RE.findall(text_content)))
+    
+    # Look for contact information in specific Craigslist sections
+    contact_sections = soup.find_all(["div", "p"], string=lambda text: text and any(
+        keyword in text.lower() for keyword in ["contact", "email", "call", "phone", "reach out"]
+    ))
+    
+    for section in contact_sections:
+        section_text = section.get_text(" ", strip=True)
+        emails.extend(EMAIL_RE.findall(section_text))
+        phones.extend(PHONE_RE.findall(section_text))
+    
+    # Remove duplicates while preserving order
+    emails = list(dict.fromkeys(emails))
+    phones = list(dict.fromkeys(phones))
+    
+    # Extract name from title (remove location and category info)
+    title = out.get("source_title", "")
+    name = title
+    
+    # Clean up Craigslist title to extract business/person name
+    if " - " in title:
+        name = title.split(" - ")[0].strip()
+    
+    # Look for business name in post content
+    business_indicators = ["llc", "inc", "corp", "company", "business", "services", "photography", "studio"]
+    lines = text_content.split('\n')
+    for line in lines[:5]:  # Check first few lines
+        if any(indicator in line.lower() for indicator in business_indicators):
+            if len(line.strip()) < 80:  # Reasonable name length
+                name = line.strip()
+                break
+    
+    # Set the extracted information
+    out["name"] = name[:80]
+    out["email"] = ", ".join(emails[:3])
+    out["phone"] = ", ".join(phones[:3])
+    out["craigslist"] = url  # Mark as Craigslist source
+    
+    # Look for social media links in the post
+    for a in soup.find_all("a", href=True):
+        kind, norm = normalize_social(a["href"])
+        if kind and norm:
+            # prefer shorter/clean profile url
+            cur = out.get(kind) or ""
+            if not cur or len(norm) < len(cur):
+                out[kind] = norm
+    
     return out
 
 
@@ -266,9 +442,24 @@ async def search_and_extract(domains: str, keywords: str, extra: str, max_result
             serps.append(r)
     
     log(f"\n🌐 Total unique URLs found: {len(serps)}")
-    log("📄 Fetching page content...")
+    
+    # Filter out recently scanned URLs (within 7 days)
+    filtered_urls = []
+    skipped_count = 0
+    
+    for r in serps:
+        url = r["href"]
+        if is_url_recently_scanned(url, days=7):
+            skipped_count += 1
+            continue
+        filtered_urls.append(url)
+    
+    if skipped_count > 0:
+        log(f"⏭️ Skipped {skipped_count} recently scanned URLs (within 7 days)")
+    
+    log(f"📄 Fetching {len(filtered_urls)} new page content...")
 
-    pages = await gather_pages([r["href"] for r in serps], progress_callback=log)
+    pages = await gather_pages(filtered_urls, progress_callback=log)
     log(f"✅ Successfully fetched {len(pages)} pages")
     
     log("🔍 Extracting contact information...")
@@ -313,6 +504,13 @@ async def search_and_extract(domains: str, keywords: str, extra: str, max_result
             deduped.append(row)
 
     log(f"✨ Final results: {len(deduped)} unique contacts after deduplication")
+    
+    # Record all scanned URLs in the database
+    log("💾 Recording scanned URLs...")
+    for url, _ in pages:
+        contacts_from_url = sum(1 for row in deduped if row.get("source_url") == url)
+        record_url_scan(url, contacts_found=contacts_from_url, scan_type='crawler')
+    
     df = pd.DataFrame(deduped, columns=DEFAULT_COLUMNS)
     return df
 
@@ -321,17 +519,17 @@ async def search_and_extract(domains: str, keywords: str, extra: str, max_result
 # Initialize database
 init_database()
 
-with gr.Blocks(title="Argos Lead Finder") as demo:
-    gr.Markdown("# Argos Lead Finder\nSearch public pages for emails, phones, and social links. Edit and export your leads table.")
+with gr.Blocks(title="Argos B2C Lead Finder") as demo:
+    gr.Markdown("# Argos B2C Lead Finder\nDiscover individual consumers, freelancers, creators, and service providers. Find emails, phones, and social profiles from personal websites, portfolios, and social media.")
 
     with gr.Tabs():
         with gr.Tab("Search"):
             with gr.Group():
                 with gr.Row():
-                    domains = gr.Textbox(label="Domains", placeholder="example.com, example.org")
-                    keywords = gr.Textbox(label="Keywords", placeholder="sales, marketing, contact")
+                    domains = gr.Textbox(label="Domains", placeholder="instagram.com, etsy.com, dribbble.com")
+                    keywords = gr.Textbox(label="Keywords", placeholder="photographer, designer, freelancer, creator")
                 with gr.Row():
-                    extra = gr.Textbox(label="Extra terms", placeholder="press, team, partners")
+                    extra = gr.Textbox(label="Extra terms", placeholder="contact, hire, portfolio, services")
                     max_results = gr.Slider(10, 100, value=30, step=5, label="Max results/query")
                 with gr.Row():
                     search_btn = gr.Button("Search & Extract", variant="primary")
@@ -347,9 +545,15 @@ with gr.Blocks(title="Argos Lead Finder") as demo:
                 )
 
         with gr.Tab("Leads"):
-            gr.Markdown("### Leads table\nEdit cells inline. Use controls below to add/remove columns and rows, or import/export.")
+            with gr.Row():
+                gr.Markdown("### Leads table\nEdit cells inline. Use controls below to add/remove columns and rows, or import/export.")
+                lead_count = gr.HTML(value="<div style='text-align: right; font-size: 18px; font-weight: bold; color: #2563eb;'>📊 Total Leads: 0</div>")
+            
             # Load existing data from database
             initial_data = load_leads_from_db()
+            lead_count_value = len(initial_data) if initial_data is not None and len(initial_data) > 0 else 0
+            lead_count.value = f"<div style='text-align: right; font-size: 18px; font-weight: bold; color: #2563eb;'>📊 Total Leads: {lead_count_value}</div>"
+            
             df = gr.Dataframe(
                 value=initial_data,
                 headers=DEFAULT_COLUMNS,
@@ -384,32 +588,32 @@ with gr.Blocks(title="Argos Lead Finder") as demo:
                         download_json = gr.File(label="JSON", interactive=False)
 
         with gr.Tab("Auto Crawler"):
-            gr.Markdown("### Advanced Auto Crawler\nAutomated contact discovery using advanced search techniques and continuous crawling.")
+            gr.Markdown("### Advanced Auto Crawler\nAutomated consumer contact discovery using advanced search techniques and continuous crawling.")
             
             with gr.Row():
                 with gr.Column():
-                    gr.Markdown("#### Crawler Settings")
-                    crawler_industry = gr.Textbox(label="Target Industry", placeholder="e.g. SaaS, E-commerce, Healthcare")
-                    crawler_location = gr.Textbox(label="Location", placeholder="e.g. San Francisco, remote, USA")
+                    gr.Markdown("#### Target Consumer Settings")
+                    crawler_industry = gr.Textbox(label="Interest/Category", placeholder="e.g. Fitness, Gaming, Fashion, Photography, Travel")
+                    crawler_location = gr.Textbox(label="Location", placeholder="e.g. San Francisco, California, USA, Remote")
                     crawler_company_size = gr.Dropdown(
-                        label="Company Size",
-                        choices=["1-10", "11-50", "51-200", "201-500", "500+", "Any"],
+                        label="Consumer Type",
+                        choices=["Individual", "Freelancer", "Small Business Owner", "Content Creator", "Enthusiast", "Any"],
                         value="Any"
                     )
                     crawler_role_types = gr.CheckboxGroup(
-                        label="Target Roles",
-                        choices=["CEO", "CTO", "VP", "Director", "Manager", "Sales", "Marketing", "Developer", "HR"],
-                        value=["CEO", "CTO", "VP"]
+                        label="Target Demographics",
+                        choices=["Freelancer", "Blogger", "Influencer", "Creator", "Small Business", "Hobbyist", "Student", "Professional", "Entrepreneur"],
+                        value=["Freelancer", "Creator", "Small Business"]
                     )
                     
                 with gr.Column():
                     gr.Markdown("#### Advanced Options")
                     crawler_social_focus = gr.CheckboxGroup(
                         label="Social Platforms to Focus",
-                        choices=["LinkedIn", "Twitter", "GitHub", "AngelList", "Crunchbase", "Craigslist"],
-                        value=["LinkedIn", "Twitter"]
+                        choices=["LinkedIn", "Twitter", "Instagram", "TikTok", "YouTube", "GitHub", "Craigslist"],
+                        value=["Twitter", "Instagram", "Craigslist"]
                     )
-                    crawler_auto_iterate = gr.Checkbox(label="Auto-Iterate (Find leads, then search for their contacts)", value=True)
+                    crawler_auto_iterate = gr.Checkbox(label="Auto-Iterate (Find contacts, then search for their networks)", value=True)
                     crawler_continuous = gr.Checkbox(label="Continuous Mode (Never stop crawling)", value=False)
                     crawler_depth = gr.Slider(1, 10, value=3, step=1, label="Crawl Depth")
                     crawler_delay = gr.Slider(5, 120, value=30, step=5, label="Delay Between Searches (seconds)")
@@ -446,36 +650,88 @@ with gr.Blocks(title="Argos Lead Finder") as demo:
                         interactive=False
                     )
 
+        with gr.Tab("URL Tracking"):
+            gr.Markdown("### Previously Scanned URLs\nTrack which URLs have been scanned to avoid redundant crawling and improve lead discovery efficiency.")
+            
+            # Get initial URL data
+            try:
+                initial_urls = get_scanned_urls()
+                initial_url_data = []
+                for url, domain, scan_date, contacts_found, scan_type, last_scan in initial_urls:
+                    initial_url_data.append([url, domain, scan_date, contacts_found, scan_type, last_scan])
+                
+                # Calculate initial statistics
+                total_urls = len(initial_urls)
+                week_count = sum(1 for _, _, _, _, _, last_scan in initial_urls 
+                                if (pd.Timestamp.now() - pd.Timestamp(last_scan)).days <= 7)
+                month_count = sum(1 for _, _, _, _, _, last_scan in initial_urls 
+                                 if (pd.Timestamp.now() - pd.Timestamp(last_scan)).days <= 30)
+                
+                initial_stats = f"""### URL Statistics
+- **Total URLs:** {total_urls}
+- **Scanned This Week:** {week_count}
+- **Scanned This Month:** {month_count}
+- **Average Contacts/URL:** {sum(contacts for _, _, _, contacts, _, _ in initial_urls) / max(total_urls, 1):.1f}"""
+            except Exception:
+                initial_url_data = []
+                initial_stats = "### URL Statistics\n- **Total URLs:** 0\n- **This Week:** 0\n- **This Month:** 0"
+            
+            with gr.Row():
+                with gr.Column(scale=3):
+                    url_table = gr.Dataframe(
+                        value=initial_url_data,
+                        headers=["URL", "Domain", "First Scan", "Contacts Found", "Scan Type", "Last Scan"],
+                        datatype=["str", "str", "str", "number", "str", "str"],
+                        interactive=False,
+                        wrap=True
+                    )
+                with gr.Column(scale=1):
+                    gr.Markdown("#### URL Management")
+                    refresh_urls_btn = gr.Button("🔄 Refresh URL List", variant="primary")
+                    url_stats = gr.Markdown(initial_stats)
+                    
+                    gr.Markdown("#### Cleanup Options")
+                    cleanup_days = gr.Slider(7, 90, value=30, step=7, label="Keep URLs for (days)")
+                    cleanup_btn = gr.Button("🗑️ Clean Old URLs", variant="secondary")
+                    cleanup_status = gr.Markdown("")
+                    
+                    gr.Markdown("#### URL Blocking")
+                    block_url = gr.Textbox(label="Block URL", placeholder="example.com/page")
+                    block_btn = gr.Button("🚫 Block URL", variant="secondary")
+                    
+                    gr.Markdown("#### Weekly Cooldown")
+                    cooldown_info = gr.Markdown("URLs are automatically blocked from re-scanning for 7 days to prevent redundancy and improve discovery.")
+
         with gr.Tab("Help"):
             gr.Markdown("""
             ## Argos Lead Finder - User Guide
             
             ### 🔍 Manual Search
-            - **Domains**: Target specific websites (e.g., "techcrunch.com, ycombinator.com")
-            - **Keywords**: Industry or role terms (e.g., "CEO, founder, startup")
-            - **Extra terms**: Additional context (e.g., "contact, about, team")
+            - **Domains**: Target specific websites (e.g., "instagram.com, etsy.com, facebook.com")
+            - **Keywords**: Interest or demographic terms (e.g., "photographer, fitness coach, blogger")
+            - **Extra terms**: Additional context (e.g., "contact, hire me, services")
             - **Console**: Real-time search progress and debugging info
             
             ### 🤖 Auto Crawler
-            Advanced automated contact discovery with intelligent search strategies:
+            Advanced automated consumer contact discovery with intelligent search strategies:
             
             **Features:**
-            - **Industry Targeting**: Focuses searches on specific industries
-            - **Role-Based Discovery**: Targets CEOs, CTOs, VPs, etc.
-            - **Social Platform Integration**: LinkedIn, Twitter, GitHub, Craigslist crawling
+            - **Interest Targeting**: Focuses searches on specific consumer interests/hobbies
+            - **Demographic Discovery**: Targets freelancers, creators, influencers, etc.
+            - **Social Platform Integration**: Instagram, Twitter, TikTok, YouTube, Craigslist crawling
             - **Intelligent Queuing**: Generates 50+ search strategies automatically
             - **Rate Limiting**: Respects website policies with configurable delays
             - **Real-time Monitoring**: Live stats and activity logging
             
             **Advanced Strategies:**
-            - Company discovery via LinkedIn pages
-            - Startup founder identification
-            - Conference speaker contact extraction
-            - Podcast guest bio mining
-            - Press release contact harvesting
-            - About us page team extraction
-            - Craigslist business services and job postings
-            - Local business owner discovery via Craigslist
+            - Influencer discovery via social media profiles
+            - Freelancer identification on portfolio sites
+            - Content creator contact extraction
+            - Local service provider discovery
+            - Community forum member harvesting
+            - Personal website contact collection
+            - Craigslist services and gig postings
+            - Local individual service providers via Craigslist
             
             ### 📊 Database Features
             - **Auto-save**: All data automatically saved to SQLite database
@@ -582,7 +838,8 @@ with gr.Blocks(title="Argos Lead Finder") as demo:
                     queue_text,  # crawler_queue
                     strategies,  # crawler_queue_list
                     working_df,  # updated dataframe
-                    insights  # crawler_insights
+                    insights,  # crawler_insights
+                    update_lead_count(working_df)  # lead_count
                 )
                 
                 try:
@@ -688,8 +945,11 @@ with gr.Blocks(title="Argos Lead Finder") as demo:
             "All iterations completed",  # crawler_queue
             strategies,  # crawler_queue_list
             working_df,  # final dataframe
-            insights  # final insights
+            insights,  # final insights
+            update_lead_count(working_df)  # lead_count
         )
+    
+    async def start_auto_crawler_live(industry, location, company_size, role_types, social_focus, depth, delay, max_per_domain, current_df):
         """Start the auto crawler with live updates"""
         
         def log_crawler(msg):
@@ -729,7 +989,9 @@ with gr.Blocks(title="Argos Lead Finder") as demo:
             f"### Statistics\n- **Total Searches:** 0/{len(strategies)}\n- **Domains Found:** 0\n- **New Contacts Found:** 0\n- **Total Contacts:** {len(working_df)}\n- **Success Rate:** 0%",  # crawler_stats
             "\n".join([f"• {s['name']}" for s in strategies[:10]]) + (f"\n... and {len(strategies) - 10} more" if len(strategies) > 10 else ""),  # crawler_queue
             strategies,  # crawler_queue_list
-            working_df  # updated dataframe
+            working_df,  # updated dataframe
+            insights,  # crawler_insights
+            update_lead_count(working_df)  # lead_count
         )
         
         for i, strategy in enumerate(strategies[:10]):  # Limit for demo
@@ -743,7 +1005,9 @@ with gr.Blocks(title="Argos Lead Finder") as demo:
                 f"### Statistics\n- **Total Searches:** {i}/{len(strategies)}\n- **Domains Found:** {len(total_domains)}\n- **New Contacts Found:** {total_new_contacts}\n- **Total Contacts:** {len(working_df)}\n- **Success Rate:** {(successful_searches / max(i, 1)) * 100:.1f}%",
                 "\n".join([f"• {s['name']}" for s in strategies[i:i+10]]) + (f"\n... and {len(strategies) - i - 10} more" if len(strategies) > i + 10 else ""),
                 strategies,
-                working_df
+                working_df,
+                insights,
+                update_lead_count(working_df)
             )
             
             try:
@@ -798,7 +1062,9 @@ with gr.Blocks(title="Argos Lead Finder") as demo:
                     stats_text,
                     queue_text,
                     strategies,
-                    working_df
+                    working_df,
+                    insights,
+                    update_lead_count(working_df)
                 )
                 
                 # Save intermediate results to database
@@ -814,7 +1080,9 @@ with gr.Blocks(title="Argos Lead Finder") as demo:
                         stats_text,
                         queue_text,
                         strategies,
-                        working_df
+                        working_df,
+                        insights,
+                        update_lead_count(working_df)
                     )
                     await asyncio.sleep(delay)
                 
@@ -827,7 +1095,9 @@ with gr.Blocks(title="Argos Lead Finder") as demo:
                     stats_text,
                     queue_text,
                     strategies,
-                    working_df
+                    working_df,
+                    insights,
+                    update_lead_count(working_df)
                 )
         
         # Final update
@@ -848,7 +1118,9 @@ with gr.Blocks(title="Argos Lead Finder") as demo:
             final_stats,
             "All searches completed",
             strategies,
-            working_df
+            working_df,
+            insights,  # crawler_insights
+            update_lead_count(working_df)  # lead_count
         )
     
     async def start_auto_crawler_simple(industry, location, company_size, role_types, social_focus, depth, delay, max_per_domain, current_df):
@@ -980,12 +1252,13 @@ with gr.Blocks(title="Argos Lead Finder") as demo:
             final_stats,
             "All searches completed",
             strategies,
-            working_df
+            working_df,
+            "🎉 Auto crawler completed successfully!"  # insights
         )
     
     def stop_auto_crawler(current_df):
         """Stop the auto crawler"""
-        return False, "Status: **Stopped** 🔴", "", "### Statistics\n- **Total Searches:** 0\n- **Domains Found:** 0\n- **Contacts Found:** 0\n- **Success Rate:** 0%", "", current_df, ""
+        return False, "Status: **Stopped** 🔴", "", "### Statistics\n- **Total Searches:** 0\n- **Domains Found:** 0\n- **Contacts Found:** 0\n- **Success Rate:** 0%", "", [], current_df, "Crawler stopped by user.", update_lead_count(current_df)
     
     def generate_adaptive_strategies(existing_df, industry, location, social_focus, depth):
         """Generate new strategies based on existing contact data"""
@@ -1049,64 +1322,86 @@ with gr.Blocks(title="Argos Lead Finder") as demo:
         return strategies[:20]  # Limit adaptive strategies
     
     def generate_crawler_strategies(industry, location, company_size, role_types, social_focus):
-        """Generate advanced search strategies based on user inputs"""
+        """Generate advanced B2C search strategies based on user inputs"""
         strategies = []
         
-        # Use fallback terms if no industry specified
-        industry_terms = industry if industry else "business CEO founder contact"
-        location_terms = location if location else "contact email phone"
+        # Use fallback terms if no interest specified
+        interest_terms = industry if industry else "freelancer photographer blogger"
+        location_terms = location if location else "contact hire services"
         
-        # Industry-specific searches
+        # Interest-based searches for consumers
         strategies.extend([
-            {"name": f"{industry_terms} companies {location_terms}", "type": "company_discovery", "query": f"site:linkedin.com/company {industry_terms} {location_terms}"},
-            {"name": f"{industry_terms} startups", "type": "startup_discovery", "query": f"{industry_terms} startup founders contact"},
-            {"name": f"{industry_terms} news mentions", "type": "news_crawl", "query": f"{industry_terms} CEO CTO contact email"},
+            {"name": f"{interest_terms} freelancers {location_terms}", "type": "freelancer_discovery", "query": f"{interest_terms} freelancer hire contact {location_terms}"},
+            {"name": f"{interest_terms} portfolio sites", "type": "portfolio_discovery", "query": f"{interest_terms} portfolio contact hire me"},
+            {"name": f"{interest_terms} local services", "type": "local_services", "query": f"{interest_terms} {location_terms} contact services"},
         ])
         
-        # Role-based searches
+        # Demographic-based searches
         if role_types:
             for role in role_types:
                 strategies.extend([
-                    {"name": f"{role} at {industry_terms} companies", "type": "role_search", "query": f"site:linkedin.com/in {role} {industry_terms} {location_terms}"},
-                    {"name": f"{role} contact pages", "type": "contact_discovery", "query": f"{role} {industry_terms} contact email phone"},
+                    {"name": f"{role} in {interest_terms}", "type": "demographic_search", "query": f"{role} {interest_terms} contact email hire"},
+                    {"name": f"{role} service pages", "type": "service_discovery", "query": f"{role} {interest_terms} services contact {location_terms}"},
                 ])
         else:
-            # Default role searches if none specified
+            # Default demographic searches if none specified
             strategies.extend([
-                {"name": "CEO contact pages", "type": "contact_discovery", "query": f"CEO {industry_terms} contact email phone"},
-                {"name": "Founder contact pages", "type": "contact_discovery", "query": f"founder {industry_terms} contact email phone"},
+                {"name": "Freelancer contact pages", "type": "contact_discovery", "query": f"freelancer {interest_terms} contact email hire"},
+                {"name": "Creator contact pages", "type": "contact_discovery", "query": f"creator {interest_terms} contact email collaboration"},
             ])
         
-        # Social platform specific searches
+        # Social platform specific searches for B2C
         if "LinkedIn" in social_focus:
-            strategies.append({"name": "LinkedIn company pages", "type": "linkedin_crawl", "query": f"site:linkedin.com/company {industry_terms}"})
+            strategies.append({"name": "LinkedIn individual profiles", "type": "linkedin_crawl", "query": f"site:linkedin.com/in {interest_terms} freelancer"})
         
         if "Twitter" in social_focus:
-            strategies.append({"name": "Twitter profiles", "type": "twitter_crawl", "query": f"site:twitter.com {industry_terms} CEO founder"})
-        
-        if "GitHub" in social_focus:
-            strategies.append({"name": "GitHub developer profiles", "type": "github_crawl", "query": f"site:github.com {industry_terms} developer contact"})
-        
-        if "Craigslist" in social_focus:
             strategies.extend([
-                {"name": "Craigslist services", "type": "craigslist_services", "query": f"site:craigslist.org {industry_terms} services contact"},
-                {"name": "Craigslist jobs", "type": "craigslist_jobs", "query": f"site:craigslist.org {industry_terms} jobs hiring {location_terms}"},
-                {"name": "Craigslist business services", "type": "craigslist_biz", "query": f"site:craigslist.org 'business services' {industry_terms} {location_terms}"},
-                {"name": "Craigslist for sale by owner", "type": "craigslist_fsbo", "query": f"site:craigslist.org 'for sale' {industry_terms} business owner contact"},
+                {"name": "Twitter creator profiles", "type": "twitter_crawl", "query": f"site:twitter.com {interest_terms} creator contact"},
+                {"name": "Twitter freelancer bios", "type": "twitter_bio_crawl", "query": f"site:twitter.com {interest_terms} freelancer hire"},
             ])
         
-        if "AngelList" in social_focus:
-            strategies.append({"name": "AngelList startups", "type": "angellist_crawl", "query": f"site:angel.co {industry_terms} startup founder"})
+        if "Instagram" in social_focus:
+            strategies.extend([
+                {"name": "Instagram creator profiles", "type": "instagram_crawl", "query": f"site:instagram.com {interest_terms} creator contact"},
+                {"name": "Instagram business profiles", "type": "instagram_biz_crawl", "query": f"site:instagram.com {interest_terms} business contact email"},
+            ])
         
-        if "Crunchbase" in social_focus:
-            strategies.append({"name": "Crunchbase companies", "type": "crunchbase_crawl", "query": f"site:crunchbase.com {industry_terms} company founder CEO"})
+        if "TikTok" in social_focus:
+            strategies.append({"name": "TikTok creator profiles", "type": "tiktok_crawl", "query": f"site:tiktok.com {interest_terms} creator contact"})
         
-        # Advanced search patterns
+        if "YouTube" in social_focus:
+            strategies.extend([
+                {"name": "YouTube creator channels", "type": "youtube_crawl", "query": f"site:youtube.com {interest_terms} creator contact business"},
+                {"name": "YouTube about pages", "type": "youtube_about_crawl", "query": f"site:youtube.com/channel {interest_terms} about contact"},
+            ])
+        
+        if "GitHub" in social_focus:
+            strategies.append({"name": "GitHub developer profiles", "type": "github_crawl", "query": f"site:github.com {interest_terms} developer contact hire"})
+        
+        if "Craigslist" in social_focus:
+            # Enhanced Craigslist strategies for individual service providers
+            base_location = location_terms.split()[0] if location_terms else ""
+            strategies.extend([
+                {"name": "Craigslist services", "type": "craigslist_services", "query": f"site:craigslist.org {interest_terms} services contact email"},
+                {"name": "Craigslist gigs", "type": "craigslist_gigs", "query": f"site:craigslist.org gigs {interest_terms} {location_terms}"},
+                {"name": "Craigslist creative services", "type": "craigslist_creative", "query": f"site:craigslist.org creative {interest_terms} portfolio contact email"},
+                {"name": "Craigslist for sale", "type": "craigslist_forsale", "query": f"site:craigslist.org 'for sale' {interest_terms} handmade contact"},
+                {"name": "Craigslist skilled trades", "type": "craigslist_trades", "query": f"site:craigslist.org skilled {interest_terms} {location_terms}"},
+                {"name": "Craigslist beauty services", "type": "craigslist_beauty", "query": f"site:craigslist.org beauty {interest_terms} {location_terms} contact"},
+                {"name": "Craigslist lessons/tutoring", "type": "craigslist_lessons", "query": f"site:craigslist.org lessons {interest_terms} tutor {location_terms}"},
+                {"name": "Craigslist computer services", "type": "craigslist_computer", "query": f"site:craigslist.org computer {interest_terms} repair {location_terms}"},
+            ])
+        
+        # B2C specific search patterns
         strategies.extend([
-            {"name": "About us pages", "type": "about_crawl", "query": f"{industry} 'about us' team {location}"},
-            {"name": "Press releases", "type": "press_crawl", "query": f"{industry} 'press release' contact media"},
-            {"name": "Conference speakers", "type": "conference_crawl", "query": f"{industry} conference speaker contact"},
-            {"name": "Podcast guests", "type": "podcast_crawl", "query": f"{industry} podcast guest bio contact"},
+            {"name": "Personal websites", "type": "personal_sites", "query": f"{interest_terms} personal website contact about"},
+            {"name": "Portfolio contact pages", "type": "portfolio_contact", "query": f"{interest_terms} portfolio contact hire me"},
+            {"name": "Service provider directories", "type": "directory_crawl", "query": f"{interest_terms} directory contact {location_terms}"},
+            {"name": "Freelancer platforms", "type": "freelancer_platforms", "query": f"{interest_terms} freelancer profile contact hire"},
+            {"name": "Creator marketplace", "type": "creator_marketplace", "query": f"{interest_terms} creator marketplace contact"},
+            {"name": "Local classifieds", "type": "local_classifieds", "query": f"{interest_terms} {location_terms} classified contact"},
+            {"name": "Community forums", "type": "forum_crawl", "query": f"{interest_terms} forum community contact member"},
+            {"name": "Meetup organizers", "type": "meetup_crawl", "query": f"{interest_terms} meetup organizer {location_terms} contact"},
         ])
         
         return strategies[:50]  # Limit to 50 strategies
@@ -1165,21 +1460,22 @@ with gr.Blocks(title="Argos Lead Finder") as demo:
             save_leads_to_db(out)
             log_progress("✅ Results saved to database")
             
-            return out, status_msg, console_output
+            return out, status_msg, console_output, update_lead_count(out)
         except Exception as e:
             error_msg = f"❌ Search failed: {str(e)}"
             log_progress(error_msg)
-            return table if table is not None else pd.DataFrame(columns=DEFAULT_COLUMNS), error_msg, console_output
+            fallback_table = table if table is not None else pd.DataFrame(columns=DEFAULT_COLUMNS)
+            return fallback_table, error_msg, console_output, update_lead_count(fallback_table)
 
     def add_column(table, name):
         if not name:
-            return table
+            return table, update_lead_count(table)
         cur = table if isinstance(table, pd.DataFrame) else pd.DataFrame(table or [], columns=df.headers)
         if name not in cur.columns:
             cur[name] = ""
         # Auto-save to database
         save_leads_to_db(cur)
-        return cur
+        return cur, update_lead_count(cur)
 
     def del_column(table, name):
         cur = table if isinstance(table, pd.DataFrame) else pd.DataFrame(table or [], columns=df.headers)
@@ -1187,7 +1483,7 @@ with gr.Blocks(title="Argos Lead Finder") as demo:
             cur = cur.drop(columns=[name])
         # Auto-save to database
         save_leads_to_db(cur)
-        return cur
+        return cur, update_lead_count(cur)
 
     def add_row(table):
         cur = table if isinstance(table, pd.DataFrame) else pd.DataFrame(table or [], columns=df.headers)
@@ -1198,7 +1494,7 @@ with gr.Blocks(title="Argos Lead Finder") as demo:
             cur = pd.concat([cur, pd.DataFrame([empty])], ignore_index=True)
         # Auto-save to database
         save_leads_to_db(cur)
-        return cur
+        return cur, update_lead_count(cur)
 
     def del_row(table, idx):
         cur = table if isinstance(table, pd.DataFrame) else pd.DataFrame(table or [], columns=df.headers)
@@ -1210,12 +1506,12 @@ with gr.Blocks(title="Argos Lead Finder") as demo:
             pass
         # Auto-save to database
         save_leads_to_db(cur)
-        return cur
+        return cur, update_lead_count(cur)
 
     def do_import(fileobj, table):
         cur = table if isinstance(table, pd.DataFrame) else pd.DataFrame(table or [], columns=df.headers)
         if not fileobj:
-            return cur
+            return cur, update_lead_count(cur)
         try:
             import io
             csv_bytes = fileobj["data"] if isinstance(fileobj, dict) else fileobj
@@ -1231,9 +1527,9 @@ with gr.Blocks(title="Argos Lead Finder") as demo:
                     merged[col] = ""
             # Auto-save to database
             save_leads_to_db(merged)
-            return merged
+            return merged, update_lead_count(merged)
         except Exception:
-            return cur
+            return cur, update_lead_count(cur)
 
     def to_csv_file(table):
         import tempfile
@@ -1255,21 +1551,72 @@ with gr.Blocks(title="Argos Lead Finder") as demo:
         if data is not None:
             df_data = pd.DataFrame(data) if not isinstance(data, pd.DataFrame) else data
             save_leads_to_db(df_data)
-        return data
+        return data, update_lead_count(data)
+
+    # URL Tracking Functions
+    def refresh_url_table():
+        """Refresh the URL tracking table"""
+        urls = get_scanned_urls()
+        url_data = []
+        for url, domain, scan_date, contacts_found, scan_type, last_scan in urls:
+            url_data.append([url, domain, scan_date, contacts_found, scan_type, last_scan])
+        
+        # Calculate statistics
+        total_urls = len(urls)
+        week_count = sum(1 for _, _, _, _, _, last_scan in urls 
+                        if (pd.Timestamp.now() - pd.Timestamp(last_scan)).days <= 7)
+        month_count = sum(1 for _, _, _, _, _, last_scan in urls 
+                         if (pd.Timestamp.now() - pd.Timestamp(last_scan)).days <= 30)
+        
+        stats = f"""### URL Statistics
+- **Total URLs:** {total_urls}
+- **Scanned This Week:** {week_count}
+- **Scanned This Month:** {month_count}
+- **Average Contacts/URL:** {sum(contacts for _, _, _, contacts, _, _ in urls) / max(total_urls, 1):.1f}"""
+        
+        return url_data, stats
+
+    def cleanup_old_urls(days):
+        """Clean up old URL records"""
+        try:
+            deleted = clear_old_url_records(days)
+            if deleted > 0:
+                status = f"✅ Cleaned {deleted} URL records older than {days} days"
+            else:
+                status = f"ℹ️ No URL records older than {days} days found"
+            
+            # Refresh the table after cleanup
+            url_data, stats = refresh_url_table()
+            return url_data, stats, status
+        except Exception as e:
+            return [], "### URL Statistics\n- **Error loading data**", f"❌ Error during cleanup: {str(e)}"
+
+    def block_url_manually(url):
+        """Manually block a URL from being scanned"""
+        if not url:
+            return "", "⚠️ Please enter a URL to block"
+        
+        try:
+            # Record the URL as scanned with 0 contacts to block it
+            record_url_scan(url, contacts_found=0, scan_type='blocked')
+            url_data, stats = refresh_url_table()
+            return url_data, stats, f"🚫 Blocked URL: {url}"
+        except Exception as e:
+            return [], "### URL Statistics\n- **Error loading data**", f"❌ Error blocking URL: {str(e)}"
 
     # Smart Crawler Event Handlers
     crawler_start_btn.click(
         smart_crawler_engine,
         inputs=[crawler_industry, crawler_location, crawler_company_size, crawler_role_types, 
                 crawler_social_focus, crawler_auto_iterate, crawler_continuous, crawler_depth, crawler_delay, crawler_max_per_domain, df],
-        outputs=[crawler_active, crawler_status, crawler_console, crawler_stats, crawler_queue, crawler_queue_list, df, crawler_insights],
+        outputs=[crawler_active, crawler_status, crawler_console, crawler_stats, crawler_queue, crawler_queue_list, df, crawler_insights, lead_count],
         show_progress=True
     )
     
     crawler_stop_btn.click(
         stop_auto_crawler,
         inputs=[df],
-        outputs=[crawler_active, crawler_status, crawler_console, crawler_stats, crawler_queue, df, crawler_insights]
+        outputs=[crawler_active, crawler_status, crawler_console, crawler_stats, crawler_queue, crawler_queue_list, df, crawler_insights, lead_count]
     )
     
     def refresh_crawler_status():
@@ -1283,17 +1630,22 @@ with gr.Blocks(title="Argos Lead Finder") as demo:
     )
 
     # Regular Event Handlers
-    search_btn.click(do_search, inputs=[domains, keywords, extra, max_results, df, console], outputs=[df, status, console])
-    add_col_btn.click(add_column, inputs=[df, add_col_name], outputs=df)
-    del_col_btn.click(del_column, inputs=[df, del_col_name], outputs=df)
-    add_row_btn.click(add_row, inputs=[df], outputs=df)
-    del_row_btn.click(del_row, inputs=[df, del_row_idx], outputs=df)
-    import_btn.click(do_import, inputs=[imp, df], outputs=df)
+    search_btn.click(do_search, inputs=[domains, keywords, extra, max_results, df, console], outputs=[df, status, console, lead_count])
+    add_col_btn.click(add_column, inputs=[df, add_col_name], outputs=[df, lead_count])
+    del_col_btn.click(del_column, inputs=[df, del_col_name], outputs=[df, lead_count])
+    add_row_btn.click(add_row, inputs=[df], outputs=[df, lead_count])
+    del_row_btn.click(del_row, inputs=[df, del_row_idx], outputs=[df, lead_count])
+    import_btn.click(do_import, inputs=[imp, df], outputs=[df, lead_count])
     export_csv_btn.click(to_csv_file, inputs=[df], outputs=download_csv)
     export_json_btn.click(to_json_file, inputs=[df], outputs=download_json)
     
+    # URL Tracking Event Handlers
+    refresh_urls_btn.click(refresh_url_table, outputs=[url_table, url_stats])
+    cleanup_btn.click(cleanup_old_urls, inputs=[cleanup_days], outputs=[url_table, url_stats, cleanup_status])
+    block_btn.click(block_url_manually, inputs=[block_url], outputs=[url_table, url_stats, cleanup_status])
+    
     # Auto-save on direct dataframe edits
-    df.change(on_dataframe_change, inputs=[df], outputs=[df])
+    df.change(on_dataframe_change, inputs=[df], outputs=[df, lead_count])
 
 if __name__ == "__main__":
     demo.queue().launch()
