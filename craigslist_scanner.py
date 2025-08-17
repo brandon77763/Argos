@@ -28,6 +28,10 @@ PHONE_RE = re.compile(r"(?:\+?\d[\s.-]?)?(?:\(\d{3}\)|\d{3})[\s.-]?\d{3}[\s.-]?\
 # Default columns for the results table
 DEFAULT_COLUMNS = ["name", "email", "phone", "post_title", "location", "category", "url", "scan_date"]
 
+# Continuous scanning control variables
+continuous_running = False
+continuous_thread = None
+
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 }
@@ -39,10 +43,10 @@ class VPNManager:
         self.current_server = None
         self.is_authenticated = False
         self.available_countries = [
-            "United States", "Canada", "United Kingdom", "Germany", "France", 
+            "United_States", "Canada", "United_Kingdom", "Germany", "France", 
             "Netherlands", "Australia", "Japan", "Singapore", "Switzerland",
             "Sweden", "Norway", "Denmark", "Finland", "Italy", "Spain",
-            "Poland", "Czech Republic", "Austria", "Belgium", "Luxembourg"
+            "Poland", "Czech_Republic", "Austria", "Belgium", "Luxembourg"
         ]
     
     def login_with_token(self, token):
@@ -155,21 +159,24 @@ class VPNManager:
             # Disconnect first if connected
             if self.is_connected:
                 subprocess.run(['nordvpn', 'disconnect'], 
-                             capture_output=True, timeout=15)
-                time.sleep(2)
+                             capture_output=True, timeout=10)
+                time.sleep(1)
             
-            # Connect to country
+            # Connect to country with shorter timeout
             result = subprocess.run(['nordvpn', 'connect', country], 
-                                  capture_output=True, text=True, timeout=30)
+                                  capture_output=True, text=True, timeout=20)
             
             if result.returncode == 0:
                 # Wait a moment for connection to establish
-                time.sleep(3)
+                time.sleep(2)
                 connected, server = self.get_connection_status()
                 return connected, f"Connected to {server}" if connected else "Connection failed"
             else:
-                return False, f"Failed to connect: {result.stderr}"
+                error_msg = result.stderr.strip() if result.stderr else result.stdout.strip()
+                return False, f"Failed to connect: {error_msg}"
                 
+        except subprocess.TimeoutExpired:
+            return False, "VPN connection timeout - this may have disrupted your SSH session"
         except subprocess.SubprocessError as e:
             return False, f"VPN connection error: {str(e)}"
     
@@ -554,6 +561,134 @@ async def scan_craigslist_for_emails(location, category, keywords, max_results, 
     else:
         return pd.DataFrame(columns=DEFAULT_COLUMNS)
 
+# Continuous Scanning Functions
+continuous_console_output = ""
+continuous_status_text = "**Continuous Status:** Stopped"
+
+def update_continuous_console(msg):
+    """Update the continuous console output"""
+    global continuous_console_output
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    continuous_console_output += f"[{timestamp}] {msg}\n"
+    return continuous_console_output
+
+def update_continuous_status(status):
+    """Update the continuous status"""
+    global continuous_status_text
+    continuous_status_text = status
+    return continuous_status_text
+
+async def continuous_scan_worker(main_keywords, location, category, keyword_list, max_results, skip_recent, interval_minutes):
+    """Worker function for continuous scanning"""
+    global continuous_running
+    
+    # Handle optional keyword rotation - if no list provided, use main keywords
+    if keyword_list and keyword_list.strip():
+        keywords = [k.strip() for k in keyword_list.split('\n') if k.strip()]
+        update_continuous_console(f"📝 Using keyword rotation: {len(keywords)} keywords")
+    else:
+        # If no keyword rotation list, use the main keywords field
+        keywords = [main_keywords if main_keywords else ""]
+        update_continuous_console(f"📝 Using main keywords field: '{main_keywords}'")
+    
+    if not keywords or (len(keywords) == 1 and not keywords[0]):
+        keywords = [""]  # Empty search as fallback
+    
+    scan_count = 0
+    
+    while continuous_running:
+        try:
+            # Rotate through keywords (or use main keywords if no rotation list)
+            current_keyword = keywords[scan_count % len(keywords)]
+            scan_count += 1
+            
+            update_continuous_console(f"🔄 Starting continuous scan #{scan_count}")
+            if keyword_list and keyword_list.strip():
+                update_continuous_console(f"📝 Using keyword: '{current_keyword}'")
+            else:
+                update_continuous_console(f"📝 Using main keywords: '{current_keyword}'")
+            update_continuous_status(f"**Continuous Status:** Running (Scan #{scan_count})")
+            
+            # Run the scan
+            results = await scan_craigslist_for_emails(
+                location, category, current_keyword, max_results, skip_recent, update_continuous_console
+            )
+            
+            if not continuous_running:
+                break
+                
+            update_continuous_console(f"✅ Scan #{scan_count} completed")
+            update_continuous_console(f"⏰ Waiting {interval_minutes} minutes before next scan...")
+            
+            # Wait for the specified interval, checking every 2 seconds if we should stop
+            wait_time = interval_minutes * 60
+            for i in range(0, wait_time, 2):
+                if not continuous_running:
+                    break
+                remaining = wait_time - i
+                if remaining > 60:
+                    mins = remaining // 60
+                    update_continuous_status(f"**Continuous Status:** Waiting ({mins}m {remaining%60}s remaining)")
+                else:
+                    update_continuous_status(f"**Continuous Status:** Waiting ({remaining}s remaining)")
+                await asyncio.sleep(2)
+                
+        except Exception as e:
+            update_continuous_console(f"❌ Error in continuous scan: {str(e)}")
+            # Wait less time before retrying for faster recovery
+            await asyncio.sleep(10)
+    
+    update_continuous_console("🛑 Continuous scanning stopped")
+    update_continuous_status("**Continuous Status:** Stopped")
+
+def start_continuous_scan(main_keywords, location, category, keyword_list, max_results, skip_recent, interval_minutes, interval_text):
+    """Start continuous scanning"""
+    global continuous_running, continuous_thread
+    
+    if continuous_running:
+        return "**Continuous Status:** Already running", "⚠️ Continuous scan is already running\n"
+    
+    continuous_running = True
+    update_continuous_console("🚀 Initializing continuous scan...")
+    
+    if keyword_list and keyword_list.strip():
+        update_continuous_console(f"📝 Keywords rotation: {keyword_list.replace(chr(10), ', ')}")
+    else:
+        update_continuous_console(f"📝 Using main keywords: '{main_keywords}'")
+    
+    update_continuous_console(f"⏰ Interval: {interval_text}")
+    
+    # Start the continuous scan in the background
+    import threading
+    def run_continuous():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            update_continuous_console("🔄 Starting continuous scan thread...")
+            loop.run_until_complete(
+                continuous_scan_worker(
+                    main_keywords, location, category, keyword_list, max_results, skip_recent, interval_minutes
+                )
+            )
+        except Exception as e:
+            update_continuous_console(f"❌ Continuous scan error: {str(e)}")
+            update_continuous_status("**Continuous Status:** Error")
+        finally:
+            loop.close()
+    
+    continuous_thread = threading.Thread(target=run_continuous, daemon=True)
+    continuous_thread.start()
+    
+    update_continuous_status("**Continuous Status:** Starting...")
+    return "**Continuous Status:** Starting...", continuous_console_output
+
+def stop_continuous_scan():
+    """Stop continuous scanning"""
+    global continuous_running
+    continuous_running = False
+    update_continuous_console("🛑 Stopping continuous scan...")
+    return "**Continuous Status:** Stopping...", continuous_console_output
+
 # Gradio Interface
 def create_interface():
     init_database()
@@ -587,6 +722,49 @@ def create_interface():
                             skip_recent = gr.Checkbox(label="Skip Recently Scanned (24h)", value=True)
                         
                         scan_btn = gr.Button("🚀 Start Scanning", variant="primary", size="lg")
+                        
+                        # Continuous Scan Controls
+                        gr.Markdown("### 🔄 Continuous Scanning")
+                        with gr.Row():
+                            continuous_scan = gr.Checkbox(
+                                label="Enable Continuous Scanning",
+                                value=False,
+                                info="Automatically repeat scans with different keywords/locations"
+                            )
+                            scan_interval = gr.Slider(
+                                1, 30, value=2, step=1, 
+                                label="Interval (minutes)",
+                                info="Time between scans (1-30 minutes for faster scanning)"
+                            )
+                        
+                        with gr.Row():
+                            fast_mode = gr.Checkbox(
+                                label="Fast Mode (seconds)",
+                                value=False,
+                                info="Use seconds instead of minutes for ultra-fast scanning"
+                            )
+                            fast_interval = gr.Slider(
+                                30, 300, value=60, step=30,
+                                label="Fast Interval (seconds)",
+                                info="Time between scans in seconds (30-300s)"
+                            )
+                        
+                        with gr.Row():
+                            start_continuous_btn = gr.Button("🔄 Start Continuous", variant="primary")
+                            stop_continuous_btn = gr.Button("⏹️ Stop Continuous", variant="secondary")
+                        
+                        with gr.Row():
+                            continuous_status = gr.Markdown("**Continuous Status:** Stopped")
+                            refresh_continuous_btn = gr.Button("🔄 Refresh Status", variant="secondary", size="sm")
+                        
+                        # Keyword rotation for continuous scanning
+                        gr.Markdown("#### Keyword Rotation (optional for continuous scans)")
+                        keyword_list = gr.Textbox(
+                            label="Keyword List (one per line) - Optional",
+                            placeholder="photography\nweb design\ncleaning\nhandyman\ncatering\n\n(Leave empty to use main keywords field)",
+                            lines=4,
+                            info="Different keywords to rotate through during continuous scanning. If empty, will use the main Keywords field above."
+                        )
                         
                     with gr.Column():
                         gr.Markdown("### Live Progress")
@@ -662,7 +840,7 @@ def create_interface():
                             country_dropdown = gr.Dropdown(
                                 choices=vpn_manager.available_countries,
                                 label="Select Country",
-                                value="United States"
+                                value="United_States"
                             )
                             auto_rotate = gr.Checkbox(
                                 label="Auto-rotate countries",
@@ -812,6 +990,43 @@ When enabled, the scanner will automatically change VPN countries every 10-15 se
             outputs=[console, scan_status, results_table]
         )
         
+        # Continuous scan handlers
+        def start_continuous_scanning(main_keywords, location, category, keyword_list, max_results, skip_recent, scan_interval, fast_mode, fast_interval):
+            """Handle starting continuous scanning"""
+            # Use fast mode interval if enabled, otherwise use regular interval
+            actual_interval = fast_interval / 60 if fast_mode else scan_interval
+            interval_text = f"{fast_interval}s" if fast_mode else f"{scan_interval}m"
+            
+            # Keywords are now optional - if no keyword list provided, it will use the main keywords field
+            return start_continuous_scan(main_keywords, location, category, keyword_list, max_results, skip_recent, actual_interval, interval_text)
+        
+        def stop_continuous_scanning():
+            """Handle stopping continuous scanning"""
+            return stop_continuous_scan()
+        
+        def get_continuous_updates():
+            """Get current continuous scan status and console output"""
+            global continuous_console_output, continuous_status_text
+            return continuous_status_text, continuous_console_output, load_emails_from_db()
+        
+        # Connect continuous scan events
+        start_continuous_btn.click(
+            start_continuous_scanning,
+            inputs=[keywords_input, location_input, category_input, keyword_list, max_results, skip_recent, scan_interval, fast_mode, fast_interval],
+            outputs=[continuous_status, console]
+        )
+        
+        stop_continuous_btn.click(
+            stop_continuous_scanning,
+            outputs=[continuous_status, console]
+        )
+        
+        # Connect refresh button for continuous status
+        refresh_continuous_btn.click(
+            get_continuous_updates,
+            outputs=[continuous_status, console, results_table]
+        )
+        
         refresh_btn.click(refresh_results, outputs=[results_table, email_count])
         clear_btn.click(clear_all_results, outputs=[results_table, email_count])
         export_csv.click(export_to_csv, outputs=[download_file])
@@ -862,6 +1077,7 @@ When enabled, the scanner will automatically change VPN countries every 10-15 se
         def connect_vpn(country):
             """Connect to VPN country"""
             vpn_log = f"🔌 Connecting to {country}...\n"
+            vpn_log += "⚠️  Warning: VPN connection may temporarily disrupt SSH sessions\n"
             try:
                 # Check if authenticated first
                 if not vpn_manager.is_authenticated:
@@ -1031,5 +1247,54 @@ nordvpn set autoconnect off
     return demo
 
 if __name__ == "__main__":
+    import socket
+    
+    def get_local_ip():
+        """Get the local IP address"""
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            local_ip = s.getsockname()[0]
+            s.close()
+            return local_ip
+        except Exception:
+            return "127.0.0.1"
+    
     demo = create_interface()
-    demo.launch(server_name="127.0.0.1", server_port=7861, share=False)
+    local_ip = get_local_ip()
+    port = 7861
+    
+    print("=" * 60)
+    print("🔍 CRAIGSLIST SCANNER - VPN & SSH FRIENDLY STARTUP")
+    print("=" * 60)
+    print(f"🌐 Local IP: {local_ip}")
+    print(f"🔌 Port: {port}")
+    print("📍 Access URLs:")
+    print(f"   • Localhost: http://localhost:{port}")
+    print(f"   • Local IP:  http://{local_ip}:{port}")
+    print(f"   • All IPs:   http://0.0.0.0:{port}")
+    print("")
+    print("� SSH/VS Code Access:")
+    print(f"   • SSH Tunnel: ssh -L {port}:localhost:{port} user@server")
+    print(f"   • VS Code Forward: Forward port {port} in VS Code")
+    print(f"   • Then access: http://localhost:{port}")
+    print("")
+    print("�💡 Connection Tips:")
+    print("   • VPN: If localhost doesn't work, try the Local IP URL")
+    print("   • SSH: Use port forwarding for remote access")
+    print("   • VS Code: Use 'Forward a Port' in terminal panel")
+    print("   • Check VPN settings to allow local network access")
+    print("=" * 60)
+    print("")
+    
+    # Launch with VPN-friendly and SSH-friendly settings
+    demo.launch(
+        server_name="0.0.0.0",  # Bind to all interfaces for VPN/SSH compatibility
+        server_port=port,
+        share=False,
+        inbrowser=False,        # Don't auto-open browser (better for SSH)
+        debug=False,
+        quiet=False,
+        show_error=True,
+        allowed_paths=["./"]    # Allow local file access
+    )

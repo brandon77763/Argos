@@ -1648,4 +1648,53 @@ with gr.Blocks(title="Argos B2C Lead Finder") as demo:
     df.change(on_dataframe_change, inputs=[df], outputs=[df, lead_count])
 
 if __name__ == "__main__":
-    demo.queue().launch()
+    import socket
+    
+    def get_local_ip():
+        """Get the local IP address"""
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            local_ip = s.getsockname()[0]
+            s.close()
+            return local_ip
+        except Exception:
+            return "127.0.0.1"
+    
+    # Configure for VPN-friendly and SSH-friendly local access
+    local_ip = get_local_ip()
+    port = 7860
+    
+    print("=" * 60)
+    print("🚀 ARGOS LEAD FINDER - VPN & SSH FRIENDLY STARTUP")
+    print("=" * 60)
+    print(f"🌐 Local IP: {local_ip}")
+    print(f"🔌 Port: {port}")
+    print("📍 Access URLs:")
+    print(f"   • Localhost: http://localhost:{port}")
+    print(f"   • Local IP:  http://{local_ip}:{port}")
+    print(f"   • All IPs:   http://0.0.0.0:{port}")
+    print("")
+    print("🔗 SSH/VS Code Access:")
+    print(f"   • SSH Tunnel: ssh -L {port}:localhost:{port} user@server")
+    print(f"   • VS Code Forward: Forward port {port} in VS Code")
+    print(f"   • Then access: http://localhost:{port}")
+    print("")
+    print("💡 Connection Tips:")
+    print("   • VPN: If localhost doesn't work, try the Local IP URL")
+    print("   • SSH: Use port forwarding for remote access")
+    print("   • VS Code: Use 'Forward a Port' in terminal panel")
+    print("   • Check firewall settings if connection fails")
+    print("=" * 60)
+    print("")
+    
+    demo.queue().launch(
+        server_name="0.0.0.0",  # Bind to all interfaces
+        server_port=port,       # Use specific port
+        share=False,            # Don't create public link
+        inbrowser=False,        # Don't auto-open browser (better for SSH)
+        debug=False,            # Disable debug mode for stability
+        quiet=False,            # Show startup messages
+        show_error=True,        # Show errors in interface
+        allowed_paths=["./"]    # Allow local file access
+    )
