@@ -1202,8 +1202,8 @@ async def process_url_queue(progress_callback=None, batch_size=10):
                 mark_url_scanned(url_id, emails_found)
                 processed += 1
                 
-                # Super fast - minimal rate limiting
-                await asyncio.sleep(0.1)  # Reduced from 1 to 0.1 seconds
+                # ULTRA FAST - no rate limiting for maximum speed
+                # await asyncio.sleep(0.1)  # Commented out for ultra speed
                 
             except Exception as e:
                 log(f"❌ Error processing {url}: {str(e)}")
@@ -1214,8 +1214,8 @@ async def process_url_queue(progress_callback=None, batch_size=10):
         stats = get_queue_stats()
         log(f"📊 Queue stats: {stats['pending']} pending, {stats['scanned']} scanned, {stats['total_emails']} total emails")
         
-        # Super fast - minimal pause between batches
-        await asyncio.sleep(0.2)  # Reduced from 2 to 0.2 seconds
+        # ULTRA FAST - no pause between batches for maximum speed
+        # await asyncio.sleep(0.2)  # Commented out for ultra speed
     
     log(f"🏁 Queue processing stopped. Processed {processed} URLs")
     return processed
@@ -1465,10 +1465,10 @@ def create_interface():
                         )
                         
                         speed_mode = gr.Radio(
-                            choices=["Normal Speed", "Fast Mode", "SUPER FAST Mode"],
-                            value="SUPER FAST Mode",
+                            choices=["Normal Speed", "Fast Mode", "ULTRA FAST Mode"],
+                            value="ULTRA FAST Mode",
                             label="Speed Mode",
-                            info="SUPER FAST: 20 parallel, minimal delays (recommended for maximum speed)"
+                            info="ULTRA FAST: 50 parallel, 2s timeouts, no delays (MAXIMUM SPEED)"
                         )
                         
                         with gr.Row():
@@ -1815,9 +1815,9 @@ When enabled, the scanner will automatically change VPN countries every 10-15 se
             update_crawler_console(f"⚡ Speed Mode: {speed_mode}")
             
             # Adjust batch size based on speed mode
-            if speed_mode == "SUPER FAST Mode":
-                batch_size = min(batch_size * 2, 50)  # Double batch size for super fast
-                update_crawler_console(f"🚀 SUPER FAST Mode: Increased batch size to {batch_size}")
+            if speed_mode == "ULTRA FAST Mode":
+                batch_size = min(batch_size * 3, 100)  # Triple batch size for ultra fast
+                update_crawler_console(f"🚀 ULTRA FAST Mode: Increased batch size to {batch_size}")
             elif speed_mode == "Fast Mode":
                 batch_size = min(batch_size + 10, 40)  # Increase batch size for fast mode
                 update_crawler_console(f"⚡ Fast Mode: Increased batch size to {batch_size}")
