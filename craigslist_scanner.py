@@ -32,6 +32,204 @@ DEFAULT_COLUMNS = ["name", "email", "phone", "post_title", "location", "category
 continuous_running = False
 continuous_thread = None
 
+# Comprehensive Craigslist crawler data
+CRAIGSLIST_LOCATIONS = [
+    # Major US Cities
+    "newyork", "losangeles", "chicago", "houston", "phoenix", "philadelphia", 
+    "sanantonio", "sandiego", "dallas", "sanjose", "austin", "jacksonville",
+    "fortworth", "columbus", "charlotte", "francisco", "indianapolis", "seattle",
+    "denver", "boston", "elpaso", "detroit", "nashville", "portland", "memphis",
+    "oklahomacity", "lasvegas", "louisville", "baltimore", "milwaukee", "albuquerque",
+    "tucson", "fresno", "sacramento", "mesa", "kansascity", "atlanta", "longbeach",
+    "colorado", "raleigh", "miami", "virginiabeach", "omaha", "oakland", "minneapolis",
+    "tulsa", "cleveland", "wichita", "arlington", "neworleans", "bakersfield",
+    "tampa", "honolulu", "anaheim", "aurora", "santaana", "stlouis", "riverside",
+    "corpus", "lexington", "pittsburgh", "anchorage", "stockton", "cincinnati",
+    "stpaul", "toledo", "greensboro", "newark", "plano", "henderson", "lincoln",
+    "buffalo", "jerseycity", "chula", "fortwayne", "orlando", "laredo", "norfolk",
+    "chandler", "madison", "lubbock", "baton", "durham", "garland", "glendale",
+    "reno", "hialeah", "chesapeake", "scottsdale", "northlas", "irving", "fremont",
+    "irvine", "birmingham", "rochester", "sanbernadino", "spokane", "gilbert",
+    "arlington", "montgomery", "boise", "richmond", "desMoines", "modesto", "fayetteville",
+    "shreveport", "akron", "tacoma", "aurora", "oxnard", "fontana", "yonkers",
+    "augusta", "mobile", "littlerock", "amarillo", "moreno", "glendale", "huntington",
+    "columbus", "grandrapids", "saltlake", "tallahassee", "worcester", "newport",
+    "providence", "overland", "santaclara", "garden", "oceanside", "chattanooga",
+    "fortlauderdale", "rancho", "santarosa", "tempe", "ontario", "eugene", "pembroke",
+    "salem", "cape", "sioux", "springfield", "peoria", "lancaster", "hayward",
+    "salinas", "jackson", "hollywood", "sunnyvale", "macon", "lakewood", "torrance",
+    "mcallen", "joliet", "rockford", "naperville", "paterson", "savannah", "bridgeport",
+    "alexandria", "pomona", "orange", "fullerton", "pasadena", "killeen", "hampton",
+    "warren", "midland", "miami", "carrollton", "coral", "thousand", "cedar", "topeka",
+    "simi", "stamford", "concord", "hartford", "kent", "lafayette", "ventura", "abilene",
+    "sterling", "westminster", "provo", "waterbury", "manchester", "daly", "allentown"
+]
+
+CRAIGSLIST_CATEGORIES = [
+    # Jobs
+    "jjj",  # all jobs
+    "acc", "ofc", "bus", "csr", "etc", "fbh", "gov", "hea", "hum", "eng", "edu",
+    "fin", "gig", "hos", "hse", "hum", "lab", "leg", "mnu", "mkt", "med", "npo",
+    "rej", "ret", "sls", "spa", "skd", "tch", "trp", "vol", "web", "wri",
+    
+    # Services
+    "bbb",  # all services
+    "aos", "aut", "bts", "biz", "cps", "crs", "evs", "fgs", "fns", "hss", "lgs",
+    "lss", "mas", "nps", "pet", "rts", "sks", "thp", "wet",
+    
+    # For Sale
+    "sss",  # all for sale
+    "ata", "pts", "bab", "bar", "bik", "boo", "cds", "car", "cta", "clt", "cto",
+    "ele", "emg", "grd", "hvy", "jwl", "mat", "mob", "msg", "pha", "pho", "rvs",
+    "spo", "sys", "tls", "toy", "wan",
+    
+    # Gigs
+    "ggg",  # all gigs
+    "cpg", "crg", "cwg", "dmg", "evg", "lbg", "msg", "tlg", "wrg",
+    
+    # Housing
+    "hhh",  # all housing
+    "apa", "roo", "sub", "hsw", "off", "swp", "vac", "rea",
+    
+    # Community
+    "ccc",  # all community
+    "act", "ats", "chi", "cls", "eve", "grp", "vol", "gen"
+]
+
+# URL tracking database functions
+def init_url_tracking_db():
+    """Initialize URL tracking database"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    # Create comprehensive URL tracking table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS url_queue (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            url TEXT UNIQUE NOT NULL,
+            location TEXT,
+            category TEXT,
+            status TEXT DEFAULT 'pending',
+            priority INTEGER DEFAULT 0,
+            discovered_date DATETIME DEFAULT CURRENT_TIMESTAMP,
+            scanned_date DATETIME,
+            emails_found INTEGER DEFAULT 0,
+            error_count INTEGER DEFAULT 0,
+            last_error TEXT
+        )
+    ''')
+    
+    # Create crawl progress tracking
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS crawl_progress (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            location TEXT,
+            category TEXT,
+            last_crawled DATETIME DEFAULT CURRENT_TIMESTAMP,
+            total_urls_found INTEGER DEFAULT 0,
+            status TEXT DEFAULT 'active'
+        )
+    ''')
+    
+    conn.commit()
+    conn.close()
+
+def add_urls_to_queue(urls_data, location="", category=""):
+    """Add discovered URLs to scanning queue"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    added_count = 0
+    for url_data in urls_data:
+        try:
+            cursor.execute('''
+                INSERT OR IGNORE INTO url_queue (url, location, category)
+                VALUES (?, ?, ?)
+            ''', (url_data['url'], location, category))
+            if cursor.rowcount > 0:
+                added_count += 1
+        except sqlite3.Error:
+            continue
+    
+    conn.commit()
+    conn.close()
+    return added_count
+
+def get_next_urls_to_scan(limit=10):
+    """Get next URLs to scan from queue"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+        SELECT id, url, location, category FROM url_queue 
+        WHERE status = 'pending' AND error_count < 3
+        ORDER BY priority DESC, discovered_date ASC 
+        LIMIT ?
+    ''', (limit,))
+    
+    urls = cursor.fetchall()
+    conn.close()
+    return urls
+
+def mark_url_scanned(url_id, emails_found=0, error=None):
+    """Mark URL as scanned in database"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    if error:
+        cursor.execute('''
+            UPDATE url_queue 
+            SET error_count = error_count + 1, last_error = ?, 
+                status = CASE WHEN error_count >= 2 THEN 'failed' ELSE 'pending' END
+            WHERE id = ?
+        ''', (error, url_id))
+    else:
+        # Update url_queue table
+        cursor.execute('''
+            UPDATE url_queue 
+            SET status = 'scanned', scanned_date = CURRENT_TIMESTAMP, 
+                emails_found = ?
+            WHERE id = ?
+        ''', (emails_found, url_id))
+        
+        # Also record in scanned_urls table for statistics tracking
+        cursor.execute('SELECT url FROM url_queue WHERE id = ?', (url_id,))
+        url_result = cursor.fetchone()
+        if url_result:
+            url = url_result[0]
+            cursor.execute('''
+                INSERT OR REPLACE INTO scanned_urls (url, emails_found, scan_date)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
+            ''', (url, emails_found))
+    
+    conn.commit()
+    conn.close()
+
+def get_queue_stats():
+    """Get URL queue statistics"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+        SELECT 
+            COUNT(*) as total,
+            SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) as pending,
+            SUM(CASE WHEN status = 'scanned' THEN 1 ELSE 0 END) as scanned,
+            SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed,
+            SUM(emails_found) as total_emails
+        FROM url_queue
+    ''')
+    
+    stats = cursor.fetchone()
+    conn.close()
+    return {
+        'total': stats[0] or 0,
+        'pending': stats[1] or 0,
+        'scanned': stats[2] or 0,
+        'failed': stats[3] or 0,
+        'total_emails': stats[4] or 0
+    }
+
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 }
@@ -374,111 +572,237 @@ async def search_craigslist(location="", category="", keywords="", max_results=5
     print(f"Found {len(craigslist_urls)} unique Craigslist URLs")
     return craigslist_urls
 
-async def extract_emails_from_post(url, title=""):
-    """Extract emails and contact info from a Craigslist post"""
-    try:
-        async with httpx.AsyncClient(headers=HEADERS, timeout=15.0) as client:
-            response = await client.get(url)
-            if response.status_code != 200:
-                return None
-            
-            soup = BeautifulSoup(response.text, 'html.parser')
-            
-            # Get the post content
-            post_body = soup.find('section', {'id': 'postingbody'})
-            if not post_body:
-                return None
-            
-            text_content = post_body.get_text()
-            
-            # Extract emails
-            emails = EMAIL_RE.findall(text_content)
-            emails = [email.lower() for email in emails if not email.endswith('.png') and not email.endswith('.jpg')]
-            
-            if not emails:
-                return None
-            
-            # Extract phones
-            phones = PHONE_RE.findall(text_content)
-            
-            # Extract location from URL or page
-            location = ""
-            try:
-                url_parts = url.split('/')
-                if len(url_parts) > 2:
-                    domain_parts = url_parts[2].split('.')
-                    if len(domain_parts) > 1:
-                        location = domain_parts[0]
-            except:
-                pass
-            
-            # Try to get location from page
-            location_elem = soup.find('span', class_='postingtitletext')
-            if location_elem:
-                location_text = location_elem.get_text()
-                if '(' in location_text and ')' in location_text:
-                    location = location_text.split('(')[-1].split(')')[0]
-            
-            # Determine category from URL
-            category = "general"
-            if '/biz/' in url:
-                category = "business services"
-            elif '/crs/' in url:
-                category = "creative services"  
-            elif '/lbs/' in url:
-                category = "labor/skilled trades"
-            elif '/cps/' in url:
-                category = "computer services"
-            elif '/bts/' in url:
-                category = "beauty/therapeutic services"
-            elif '/evs/' in url:
-                category = "event services"
-            elif '/fgs/' in url:
-                category = "financial/legal services"
-            elif '/hss/' in url:
-                category = "household services"
-            elif '/lss/' in url:
-                category = "lessons/tutoring"
-            elif '/mas/' in url:
-                category = "automotive services"
-            elif '/rts/' in url:
-                category = "real estate services"
-            elif '/trv/' in url:
-                category = "travel/vacation services"
-            elif '/wet/' in url:
-                category = "writing/editing/translation"
-            
-            # Extract name (try to find business/person name)
-            name = ""
-            
-            # Look for name patterns in the text
-            lines = text_content.split('\n')
-            for line in lines[:5]:  # Check first few lines
-                line = line.strip()
-                if len(line) > 3 and len(line) < 50:
-                    # Skip lines that are all caps or look like spam
-                    if not line.isupper() and not any(spam in line.lower() for spam in ['call now', 'click here', 'visit']):
-                        name = line
-                        break
-            
-            if not name and title:
-                name = title.split(' - ')[0].strip()[:50]
-            
-            return {
-                'name': name,
-                'email': ', '.join(emails[:3]),  # Limit to 3 emails
-                'phone': ', '.join(phones[:2]),  # Limit to 2 phones
-                'post_title': title,
-                'location': location,
-                'category': category,
-                'url': url,
-                'scan_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            }
-            
-    except Exception as e:
-        print(f"Error extracting from {url}: {e}")
-        return None
+# VPN rotation tracking
+current_vpn_country = None
+vpn_rotation_count = 0
+last_ip_check = None
+consecutive_network_errors = 0  # Track consecutive real network errors
 
+async def rotate_vpn_if_needed(force_rotate=False, is_network_error=False):
+    """Rotate VPN IP only for real network blocks, not HTTP errors"""
+    global current_vpn_country, vpn_rotation_count, last_ip_check, consecutive_network_errors
+    
+    # Track consecutive network errors (not HTTP errors like 404)
+    if is_network_error:
+        consecutive_network_errors += 1
+    else:
+        # Reset on successful requests
+        consecutive_network_errors = max(0, consecutive_network_errors - 1)
+    
+    # Only rotate for actual network blocks, not HTTP status codes
+    should_rotate = force_rotate or consecutive_network_errors >= 5  # Increased threshold
+    
+    if not should_rotate:
+        return True, last_ip_check or vpn_manager.get_current_ip()
+    
+    # Country rotation list (prioritizing fast countries)
+    countries = ["United_States", "Canada", "United_Kingdom", "Germany", "Netherlands", "France"]
+    
+    try:
+        # Get current IP before rotation
+        old_ip = vpn_manager.get_current_ip()
+        
+        # Select next country
+        if current_vpn_country in countries:
+            current_index = countries.index(current_vpn_country)
+            next_country = countries[(current_index + 1) % len(countries)]
+        else:
+            next_country = countries[0]
+        
+        print(f"🔄 Rotating VPN from {current_vpn_country} to {next_country} (after {consecutive_network_errors} network errors)")
+        
+        # Connect to new country
+        success, message = vpn_manager.connect_to_country(next_country)
+        
+        if success:
+            # Wait for connection to stabilize
+            await asyncio.sleep(1)  # Reduced from 2 to 1 second for speed
+            
+            # Validate IP change
+            new_ip = vpn_manager.get_current_ip()
+            
+            if new_ip != old_ip and new_ip != "Unable to fetch IP":
+                current_vpn_country = next_country
+                last_ip_check = new_ip
+                consecutive_network_errors = 0  # Reset on successful rotation
+                print(f"✅ VPN rotated successfully: {old_ip} → {new_ip}")
+                return True, new_ip
+            else:
+                print(f"⚠️ IP didn't change after rotation: {old_ip} → {new_ip}")
+                return False, old_ip
+        else:
+            print(f"❌ VPN rotation failed: {message}")
+            return False, old_ip
+        
+    except Exception as e:
+        print(f"❌ Error during VPN rotation: {str(e)}")
+        return False, "Error"
+
+async def extract_emails_from_post(url, title="", max_retries=3):
+    """Extract emails and contact info from a Craigslist post with smart VPN rotation"""
+    global vpn_rotation_count, consecutive_network_errors
+    
+    for attempt in range(max_retries):
+        try:
+            # Only rotate VPN if forced or experiencing consecutive network errors
+            if attempt > 0:
+                await rotate_vpn_if_needed(is_network_error=True)
+            
+            # ULTRA FAST timeout strategies
+            timeout = 2.0 if attempt == 0 else 4.0  # Reduced from 5/8 to 2/4 seconds
+            
+            async with httpx.AsyncClient(
+                headers={
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                    'Accept-Language': 'en-US,en;q=0.5',
+                    'Accept-Encoding': 'gzip, deflate',
+                    'Connection': 'keep-alive',
+                },
+                timeout=timeout,
+                follow_redirects=True
+            ) as client:
+                
+                response = await client.get(url)
+                vpn_rotation_count += 1
+                
+                # Handle HTTP status codes - DON'T rotate VPN for HTTP errors
+                if response.status_code == 404:
+                    print(f"⚠️ HTTP 404 (Post Not Found) for {url} - skipping")
+                    return None
+                elif response.status_code == 403:
+                    print(f"⚠️ HTTP 403 (Forbidden) for {url} - possible rate limit")
+                    # Only count as network error for potential blocks
+                    await rotate_vpn_if_needed(is_network_error=True)
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(2)
+                        continue
+                    return None
+                elif response.status_code != 200:
+                    print(f"⚠️ HTTP {response.status_code} for {url} - skipping")
+                    return None
+                
+                soup = BeautifulSoup(response.text, 'html.parser')
+                
+                # Get the post content
+                post_body = soup.find('section', {'id': 'postingbody'})
+                if not post_body:
+                    return None
+                
+                text_content = post_body.get_text()
+                
+                # Extract emails
+                emails = EMAIL_RE.findall(text_content)
+                emails = [email.lower() for email in emails if not email.endswith('.png') and not email.endswith('.jpg')]
+                
+                if not emails:
+                    return None
+                
+                # Extract phones
+                phones = PHONE_RE.findall(text_content)
+                
+                # Extract location from URL or page
+                location = ""
+                try:
+                    url_parts = url.split('/')
+                    if len(url_parts) > 2:
+                        domain_parts = url_parts[2].split('.')
+                        if len(domain_parts) > 1:
+                            location = domain_parts[0]
+                except:
+                    pass
+                
+                # Try to get location from page
+                location_elem = soup.find('span', class_='postingtitletext')
+                if location_elem:
+                    location_text = location_elem.get_text()
+                    if '(' in location_text and ')' in location_text:
+                        location = location_text.split('(')[-1].split(')')[0]
+                
+                # Determine category from URL
+                category = "general"
+                if '/biz/' in url:
+                    category = "business services"
+                elif '/crs/' in url:
+                    category = "creative services"  
+                elif '/lbs/' in url:
+                    category = "labor/skilled trades"
+                elif '/cps/' in url:
+                    category = "computer services"
+                elif '/bts/' in url:
+                    category = "beauty/therapeutic services"
+                elif '/evs/' in url:
+                    category = "event services"
+                elif '/fgs/' in url:
+                    category = "financial/legal services"
+                elif '/hss/' in url:
+                    category = "household services"
+                elif '/lss/' in url:
+                    category = "lessons/tutoring"
+                elif '/mas/' in url:
+                    category = "automotive services"
+                elif '/rts/' in url:
+                    category = "real estate services"
+                elif '/trv/' in url:
+                    category = "travel/vacation services"
+                elif '/wet/' in url:
+                    category = "writing/editing/translation"
+                
+                # Extract name (try to find business/person name)
+                name = ""
+                
+                # Look for name patterns in the text
+                lines = text_content.split('\n')
+                for line in lines[:5]:  # Check first few lines
+                    line = line.strip()
+                    if len(line) > 3 and len(line) < 50:
+                        # Skip lines that are all caps or look like spam
+                        if not line.isupper() and not any(spam in line.lower() for spam in ['call now', 'click here', 'visit']):
+                            name = line
+                            break
+                
+                if not name and title:
+                    name = title.split(' - ')[0].strip()[:50]
+                
+                # Reset network error count on successful extraction
+                await rotate_vpn_if_needed(is_network_error=False)
+                
+                return {
+                    'name': name,
+                    'email': ', '.join(emails[:3]),  # Limit to 3 emails
+                    'phone': ', '.join(phones[:2]),  # Limit to 2 phones
+                    'post_title': title,
+                    'location': location,
+                    'category': category,
+                    'url': url,
+                    'scan_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                }
+                
+        except (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError) as e:
+            error_msg = str(e)
+            if "Name or service not known" in error_msg or "ConnectError" in error_msg:
+                print(f"🌐 Network error for {url}: {error_msg}")
+                await rotate_vpn_if_needed(is_network_error=True)
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(0.5)  # Reduced from 1 to 0.5 seconds
+                    continue
+                else:
+                    print(f"❌ Network error after {max_retries} attempts: {url}")
+                    return None
+            else:
+                print(f"❌ HTTP client error for {url}: {error_msg}")
+                return None
+                
+        except Exception as e:
+            error_msg = str(e)
+            if attempt < max_retries - 1:
+                print(f"⚠️ Error extracting from {url}: {error_msg}, retrying...")
+                await asyncio.sleep(0.2)  # Reduced from 0.5 to 0.2 seconds
+                continue
+            else:
+                print(f"❌ Failed to extract from {url} after {max_retries} attempts: {error_msg}")
+                return None
+    
 async def scan_craigslist_for_emails(location, category, keywords, max_results, skip_recent=True, progress_callback=None):
     """Main function to scan Craigslist for emails with VPN integration"""
     
@@ -525,34 +849,76 @@ async def scan_craigslist_for_emails(location, category, keywords, max_results, 
     
     log(f"📧 Extracting emails from {len(posts)} posts...")
     
-    # Extract emails from each post
+    # Initialize VPN rotation
+    if vpn_manager.is_authenticated:
+        await rotate_vpn_if_needed(force_rotate=True)
+    
+    # Extract emails from posts with ULTRA FAST parallel processing
     email_records = []
     processed = 0
+    batch_size = 50  # Increased from 20 to 50 for ULTRA FAST processing
     
-    for i, post in enumerate(posts, 1):
+    for i in range(0, len(posts), batch_size):
+        batch = posts[i:i + batch_size]
+        batch_tasks = []
+        
+        log(f"� Processing batch {i//batch_size + 1}: posts {i+1}-{min(i+batch_size, len(posts))}")
+        
+        # Create concurrent tasks for this batch
+        for j, post in enumerate(batch):
+            task = extract_emails_from_post(post['url'], post['title'])
+            batch_tasks.append((task, post))
+        
+        # Execute batch concurrently
         try:
-            log(f"📄 Processing post {i}/{len(posts)}: {post['title'][:50]}...")
+            results = await asyncio.gather(*[task for task, post in batch_tasks], return_exceptions=True)
             
-            email_data = await extract_emails_from_post(post['url'], post['title'])
+            # Process results
+            for idx, (result, (task, post)) in enumerate(zip(results, batch_tasks)):
+                post_num = i + idx + 1
+                try:
+                    log(f"📄 Processing result {post_num}/{len(posts)}: {post['title'][:50]}...")
+                    
+                    if isinstance(result, Exception):
+                        log(f"❌ Error in post {post_num}: {str(result)}")
+                        record_scanned_url(post['url'], 0)
+                        continue
+                    
+                    email_data = result
+                    emails_found = 0
+                    
+                    if email_data and email_data['email']:
+                        email_records.append(email_data)
+                        save_email_to_db(tuple(email_data[col] for col in DEFAULT_COLUMNS))
+                        emails_found = len(email_data['email'].split(','))
+                        log(f"✅ Found {emails_found} emails in post {post_num}")
+                    
+                    record_scanned_url(post['url'], emails_found)
+                    processed += 1
+                    
+                except Exception as e:
+                    log(f"❌ Error processing result {post_num}: {e}")
+                    continue
             
-            # Record that we scanned this URL
-            emails_found = 0
-            if email_data and email_data['email']:
-                email_records.append(email_data)
-                save_email_to_db(tuple(email_data[col] for col in DEFAULT_COLUMNS))
-                emails_found = len(email_data['email'].split(','))
-                log(f"✅ Found {emails_found} emails in post")
-            
-            record_scanned_url(post['url'], emails_found)
-            processed += 1
-            
-            # Rate limiting
-            if i % 5 == 0:
-                await asyncio.sleep(2)
+            # ULTRA FAST - no delays between batches for maximum speed
+            # await asyncio.sleep(0.1)  # Commented out for ultra speed
                 
         except Exception as e:
-            log(f"❌ Error processing post {i}: {e}")
-            continue
+            log(f"❌ Error in batch processing: {e}")
+            # Fallback to individual processing for this batch
+            for task, post in batch_tasks:
+                try:
+                    email_data = await task
+                    emails_found = 0
+                    if email_data and email_data['email']:
+                        email_records.append(email_data)
+                        save_email_to_db(tuple(email_data[col] for col in DEFAULT_COLUMNS))
+                        emails_found = len(email_data['email'].split(','))
+                    record_scanned_url(post['url'], emails_found)
+                    processed += 1
+                except Exception as inner_e:
+                    log(f"❌ Error in fallback processing: {inner_e}")
+                    continue
     
     log(f"🎉 Scan complete! Found {len(email_records)} posts with emails out of {processed} processed")
     
@@ -560,6 +926,299 @@ async def scan_craigslist_for_emails(location, category, keywords, max_results, 
         return pd.DataFrame(email_records, columns=DEFAULT_COLUMNS)
     else:
         return pd.DataFrame(columns=DEFAULT_COLUMNS)
+
+def is_url_in_database_batch(urls):
+    """Check multiple URLs at once for better performance"""
+    try:
+        if not urls:
+            return {}
+        
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        
+        # Create placeholder string for IN clause
+        placeholders = ','.join('?' * len(urls))
+        
+        # Check both tables in one query each
+        cursor.execute(f'SELECT url FROM url_queue WHERE url IN ({placeholders})', urls)
+        queue_urls = {row[0] for row in cursor.fetchall()}
+        
+        cursor.execute(f'SELECT url FROM scanned_urls WHERE url IN ({placeholders})', urls)
+        scanned_urls = {row[0] for row in cursor.fetchall()}
+        
+        conn.close()
+        
+        # Return dictionary of URL -> exists status
+        existing_urls = queue_urls | scanned_urls
+        return {url: url in existing_urls for url in urls}
+        
+    except Exception as e:
+        print(f"Error checking URLs in database: {e}")
+        return {url: False for url in urls}  # Default to not exists on error
+
+def is_url_in_database(url):
+    """Check if URL already exists in database (either queue or scanned)"""
+    result = is_url_in_database_batch([url])
+    return result.get(url, False)
+
+# Comprehensive Craigslist Discovery Functions
+async def discover_craigslist_urls(location, category, progress_callback=None):
+    """Discover URLs by parsing Craigslist category listing pages (NOT individual posts)"""
+    
+    def log(msg):
+        if progress_callback:
+            progress_callback(msg)
+    
+    discovered_urls = []
+    
+    try:
+        # Build the category listing page URL (not individual post URLs)
+        base_url = f"https://{location}.craigslist.org"
+        
+        # Build category listing URL - this shows the list of posts, not individual posts
+        if category in ["jjj", "acc", "ofc", "bus", "csr", "etc", "fbh", "gov", "hea", "hum", "eng", "edu"]:
+            # Jobs categories
+            listing_url = f"{base_url}/d/jobs/search/{category}"
+        elif category in ["bbb", "aos", "aut", "bts", "biz", "cps", "crs", "evs", "fgs"]:
+            # Services categories  
+            listing_url = f"{base_url}/d/services/search/{category}"
+        else:
+            # General search
+            listing_url = f"{base_url}/d/for-sale/search/{category}"
+        
+        log(f"🔍 Discovering URLs from category listing: {listing_url}")
+        
+        # Parse the category listing page to extract post URLs
+        async with httpx.AsyncClient(
+            headers={
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            },
+            timeout=3.0,  # Reduced from 10 to 3 seconds for SPEED
+            follow_redirects=True
+        ) as client:
+            
+            response = await client.get(listing_url)
+            
+            if response.status_code != 200:
+                log(f"❌ Failed to fetch listing page: HTTP {response.status_code}")
+                return []
+            
+            soup = BeautifulSoup(response.text, 'html.parser')
+            
+            # Find all post links in the listing
+            post_links = soup.find_all('a', class_='cl-app-anchor')
+            if not post_links:
+                # Try alternative selectors
+                post_links = soup.find_all('a', {'data-id': True})
+            if not post_links:
+                # Try href pattern matching for Craigslist posts
+                all_links = soup.find_all('a', href=True)
+                post_links = [link for link in all_links if '/d/' in link['href'] and any(char.isdigit() for char in link['href'])]
+            
+            log(f"� Found {len(post_links)} posts in category listing")
+            
+            for link in post_links:
+                try:
+                    href = link.get('href', '')
+                    if not href:
+                        continue
+                    
+                    # Convert relative URLs to absolute
+                    if href.startswith('/'):
+                        full_url = base_url + href
+                    elif href.startswith('http'):
+                        full_url = href
+                    else:
+                        continue
+                    
+                    # Only include actual Craigslist post URLs
+                    if '/d/' in full_url and full_url.endswith('.html'):
+                        # Check if URL already exists in database
+                        if not is_url_in_database(full_url):
+                            title = link.get_text(strip=True) or "No title"
+                            
+                            discovered_urls.append({
+                                'url': full_url,
+                                'title': title,
+                                'location': location,
+                                'category': category
+                            })
+                            
+                            # Log every 50 discoveries
+                            if len(discovered_urls) % 50 == 0:
+                                log(f"📊 Discovered {len(discovered_urls)} new URLs so far...")
+                        
+                except Exception as e:
+                    continue
+            
+            # Try to get more pages by following pagination
+            next_links = soup.find_all('a', {'class': 'button next'})
+            page_count = 1
+            
+            for next_link in next_links[:3]:  # Limit to 3 additional pages for speed
+                try:
+                    next_href = next_link.get('href')
+                    if next_href and next_href.startswith('/'):
+                        next_url = base_url + next_href
+                        page_count += 1
+                        log(f"📖 Scanning page {page_count}...")
+                        
+                        next_response = await client.get(next_url)
+                        if next_response.status_code == 200:
+                            next_soup = BeautifulSoup(next_response.text, 'html.parser')
+                            next_post_links = next_soup.find_all('a', class_='cl-app-anchor')
+                            
+                            for link in next_post_links:
+                                try:
+                                    href = link.get('href', '')
+                                    if href.startswith('/'):
+                                        full_url = base_url + href
+                                    elif href.startswith('http'):
+                                        full_url = href
+                                    else:
+                                        continue
+                                    
+                                    if '/d/' in full_url and full_url.endswith('.html'):
+                                        if not is_url_in_database(full_url):
+                                            title = link.get_text(strip=True) or "No title"
+                                            discovered_urls.append({
+                                                'url': full_url,
+                                                'title': title,
+                                                'location': location,
+                                                'category': category
+                                            })
+                                except Exception:
+                                    continue
+                                    
+                        await asyncio.sleep(1)  # Rate limiting between pages
+                        
+                except Exception as e:
+                    break
+        
+        log(f"✅ Discovery complete: Found {len(discovered_urls)} new URLs for {location}/{category}")
+        return discovered_urls
+        
+    except Exception as e:
+        log(f"❌ Error discovering URLs: {str(e)}")
+        return []
+
+async def comprehensive_craigslist_crawl(progress_callback=None, max_locations=10, max_categories=10):
+    """Comprehensive crawl of Craigslist to discover all URLs"""
+    
+    def log(msg):
+        if progress_callback:
+            progress_callback(msg)
+    
+    log("🚀 Starting comprehensive Craigslist crawl...")
+    
+    total_discovered = 0
+    locations_to_crawl = CRAIGSLIST_LOCATIONS[:max_locations]
+    categories_to_crawl = CRAIGSLIST_CATEGORIES[:max_categories]
+    
+    for i, location in enumerate(locations_to_crawl, 1):
+        if not continuous_running:
+            break
+            
+        log(f"🌍 Crawling location {i}/{len(locations_to_crawl)}: {location}")
+        
+        for j, category in enumerate(categories_to_crawl, 1):
+            if not continuous_running:
+                break
+                
+            try:
+                log(f"📂 Category {j}/{len(categories_to_crawl)}: {category}")
+                
+                # Discover URLs for this location/category
+                urls = await discover_craigslist_urls(location, category, progress_callback)
+                
+                if urls:
+                    # Add to URL queue
+                    added = add_urls_to_queue(urls, location, category)
+                    total_discovered += added
+                    log(f"✅ Added {added} new URLs to queue")
+                
+                # Update crawl progress
+                conn = sqlite3.connect(DB_PATH)
+                cursor = conn.cursor()
+                cursor.execute('''
+                    INSERT OR REPLACE INTO crawl_progress 
+                    (location, category, last_crawled, total_urls_found)
+                    VALUES (?, ?, CURRENT_TIMESTAMP, ?)
+                ''', (location, category, len(urls)))
+                conn.commit()
+                conn.close()
+                
+                # ULTRA FAST - minimal rate limiting between categories
+                await asyncio.sleep(0.1)  # Reduced from 0.5 to 0.1 seconds
+                
+            except Exception as e:
+                log(f"❌ Error crawling {location}/{category}: {str(e)}")
+                continue
+        
+        # ULTRA FAST - minimal rate limiting between locations  
+        await asyncio.sleep(0.2)  # Reduced from 1 to 0.2 seconds
+    
+    log(f"🎉 Crawl complete! Discovered {total_discovered} new URLs")
+    return total_discovered
+
+async def process_url_queue(progress_callback=None, batch_size=10):
+    """Process URLs from the queue systematically"""
+    
+    def log(msg):
+        if progress_callback:
+            progress_callback(msg)
+    
+    processed = 0
+    
+    while continuous_running:
+        # Get next batch of URLs to scan
+        urls_to_scan = get_next_urls_to_scan(batch_size)
+        
+        if not urls_to_scan:
+            log("📋 URL queue is empty - starting discovery crawl...")
+            await comprehensive_craigslist_crawl(progress_callback, max_locations=5, max_categories=5)
+            continue
+        
+        log(f"📄 Processing {len(urls_to_scan)} URLs from queue...")
+        
+        for url_id, url, location, category in urls_to_scan:
+            if not continuous_running:
+                break
+                
+            try:
+                log(f"🔍 Scanning: {url}")
+                
+                # Extract emails from this URL
+                email_data = await extract_emails_from_post(url, f"Queue scan")
+                
+                emails_found = 0
+                if email_data and email_data['email']:
+                    # Save to database
+                    save_email_to_db(tuple(email_data[col] for col in DEFAULT_COLUMNS))
+                    emails_found = len(email_data['email'].split(','))
+                    log(f"✅ Found {emails_found} emails")
+                
+                # Mark as scanned
+                mark_url_scanned(url_id, emails_found)
+                processed += 1
+                
+                # Super fast - minimal rate limiting
+                await asyncio.sleep(0.1)  # Reduced from 1 to 0.1 seconds
+                
+            except Exception as e:
+                log(f"❌ Error processing {url}: {str(e)}")
+                mark_url_scanned(url_id, 0, str(e))
+                continue
+        
+        # Show queue stats
+        stats = get_queue_stats()
+        log(f"📊 Queue stats: {stats['pending']} pending, {stats['scanned']} scanned, {stats['total_emails']} total emails")
+        
+        # Super fast - minimal pause between batches
+        await asyncio.sleep(0.2)  # Reduced from 2 to 0.2 seconds
+    
+    log(f"🏁 Queue processing stopped. Processed {processed} URLs")
+    return processed
 
 # Continuous Scanning Functions
 continuous_console_output = ""
@@ -692,6 +1351,7 @@ def stop_continuous_scan():
 # Gradio Interface
 def create_interface():
     init_database()
+    init_url_tracking_db()  # Initialize URL tracking
     
     with gr.Blocks(title="Craigslist Email Scanner", theme=gr.themes.Soft()) as demo:
         gr.Markdown("# 📧 Craigslist Email Scanner\nExtract contact information from Craigslist posts efficiently")
@@ -732,21 +1392,21 @@ def create_interface():
                                 info="Automatically repeat scans with different keywords/locations"
                             )
                             scan_interval = gr.Slider(
-                                1, 30, value=2, step=1, 
+                                0.5, 30, value=1, step=0.5, 
                                 label="Interval (minutes)",
-                                info="Time between scans (1-30 minutes for faster scanning)"
+                                info="Time between scans (0.5-30 minutes for SUPER FAST scanning)"
                             )
                         
                         with gr.Row():
                             fast_mode = gr.Checkbox(
-                                label="Fast Mode (seconds)",
-                                value=False,
-                                info="Use seconds instead of minutes for ultra-fast scanning"
+                                label="SUPER FAST Mode (seconds)",
+                                value=True,  # Default to super fast
+                                info="Use seconds instead of minutes for LIGHTNING FAST scanning"
                             )
                             fast_interval = gr.Slider(
-                                30, 300, value=60, step=30,
-                                label="Fast Interval (seconds)",
-                                info="Time between scans in seconds (30-300s)"
+                                10, 300, value=30, step=10,
+                                label="SUPER FAST Interval (seconds)",
+                                info="Time between scans in seconds (10-300s for maximum speed)"
                             )
                         
                         with gr.Row():
@@ -777,6 +1437,67 @@ def create_interface():
                         )
                         
                         scan_status = gr.Markdown("**Status:** Ready to scan")
+                        vpn_rotation_status = gr.Markdown("**VPN Status:** Not monitored")
+            
+            with gr.Tab("🌐 Comprehensive Crawler"):
+                gr.Markdown("### 🔍 Comprehensive Craigslist Crawler\nSystematically scan ALL Craigslist locations and categories")
+                
+                with gr.Row():
+                    with gr.Column():
+                        gr.Markdown("#### Crawler Settings")
+                        
+                        max_locations_slider = gr.Slider(
+                            1, 50, value=10, step=1,
+                            label="Max Locations",
+                            info="Number of cities to crawl (1-50)"
+                        )
+                        
+                        max_categories_slider = gr.Slider(
+                            1, 30, value=10, step=1,
+                            label="Max Categories", 
+                            info="Number of categories per city (1-30)"
+                        )
+                        
+                        crawler_batch_size = gr.Slider(
+                            5, 50, value=20, step=5,
+                            label="Batch Size",
+                            info="URLs to process at once"
+                        )
+                        
+                        speed_mode = gr.Radio(
+                            choices=["Normal Speed", "Fast Mode", "SUPER FAST Mode"],
+                            value="SUPER FAST Mode",
+                            label="Speed Mode",
+                            info="SUPER FAST: 20 parallel, minimal delays (recommended for maximum speed)"
+                        )
+                        
+                        with gr.Row():
+                            start_crawler_btn = gr.Button("🚀 Start Comprehensive Crawl", variant="primary", size="lg")
+                            stop_crawler_btn = gr.Button("⏹️ Stop Crawler", variant="secondary")
+                        
+                        crawler_mode = gr.Radio(
+                            choices=["Discovery Mode", "Queue Processing", "Full Crawl"],
+                            value="Full Crawl",
+                            label="Crawler Mode",
+                            info="Discovery: Parse category pages to find new URLs only | Queue: Extract emails from queued URLs only | Full: Discovery + Queue processing"
+                        )
+                        
+                    with gr.Column():
+                        gr.Markdown("#### Crawler Status")
+                        
+                        crawler_status = gr.Markdown("**Crawler Status:** Stopped")
+                        
+                        crawler_console = gr.Textbox(
+                            label="Crawler Progress",
+                            placeholder="Crawler activity will appear here...",
+                            lines=12,
+                            interactive=False,
+                            show_copy_button=True
+                        )
+                        
+                        queue_stats = gr.Markdown("**Queue Stats:** Loading...")
+                        
+                        refresh_queue_btn = gr.Button("🔄 Refresh Queue Stats")
             
             with gr.Tab("📧 Results"):
                 with gr.Row():
@@ -955,13 +1676,36 @@ When enabled, the scanner will automatically change VPN countries every 10-15 se
                 cursor.execute("SELECT COUNT(*) FROM emails WHERE scan_date > datetime('now', '-24 hours')")
                 recent_emails = cursor.fetchone()[0]
                 
+                # Get total scanned from both tables
                 cursor.execute('SELECT COUNT(*) FROM scanned_urls')
-                total_scanned = cursor.fetchone()[0]
+                scanned_urls_count = cursor.fetchone()[0]
                 
-                # Get recent activity
+                cursor.execute("SELECT COUNT(*) FROM url_queue WHERE status = 'scanned'")
+                queue_scanned_count = cursor.fetchone()[0]
+                
+                total_scanned = scanned_urls_count + queue_scanned_count
+                
+                # Get queue statistics
                 cursor.execute('''
-                    SELECT url, scan_date, emails_found 
+                    SELECT 
+                        COUNT(*) as total,
+                        SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) as pending,
+                        SUM(CASE WHEN status = 'scanned' THEN 1 ELSE 0 END) as scanned,
+                        SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed,
+                        COALESCE(SUM(emails_found), 0) as queue_emails
+                    FROM url_queue
+                ''')
+                queue_stats = cursor.fetchone()
+                
+                # Get recent activity from both tables
+                cursor.execute('''
+                    SELECT url, scan_date, emails_found, 'regular' as source
                     FROM scanned_urls 
+                    WHERE scan_date IS NOT NULL
+                    UNION ALL
+                    SELECT url, scanned_date, emails_found, 'crawler' as source
+                    FROM url_queue 
+                    WHERE status = 'scanned' AND scanned_date IS NOT NULL
                     ORDER BY scan_date DESC 
                     LIMIT 20
                 ''')
@@ -969,14 +1713,24 @@ When enabled, the scanner will automatically change VPN countries every 10-15 se
                 
                 conn.close()
                 
+                # Calculate success rate
+                success_rate = (unique_posts/max(total_scanned,1)*100) if total_scanned > 0 else 0
+                
                 stats_text = f"""### Scanning Statistics
 - **Total Emails Found:** {total_emails}
 - **Unique Posts Scanned:** {unique_posts}
 - **Emails Found (24h):** {recent_emails}
 - **Total URLs Scanned:** {total_scanned}
-- **Success Rate:** {(unique_posts/max(total_scanned,1)*100):.1f}%"""
+- **Success Rate:** {success_rate:.1f}%
+
+### Crawler Queue Statistics
+- **Total URLs in Queue:** {queue_stats[0] if queue_stats else 0}
+- **Pending URLs:** {queue_stats[1] if queue_stats else 0}
+- **Scanned URLs:** {queue_stats[2] if queue_stats else 0}
+- **Failed URLs:** {queue_stats[3] if queue_stats else 0}
+- **Queue Emails Found:** {queue_stats[4] if queue_stats else 0}"""
                 
-                recent_df = pd.DataFrame(recent_data, columns=["URL", "Scan Date", "Emails Found"])
+                recent_df = pd.DataFrame(recent_data, columns=["URL", "Scan Date", "Emails Found", "Source"])
                 
                 return stats_text, recent_df
                 
@@ -1031,6 +1785,119 @@ When enabled, the scanner will automatically change VPN countries every 10-15 se
         clear_btn.click(clear_all_results, outputs=[results_table, email_count])
         export_csv.click(export_to_csv, outputs=[download_file])
         refresh_stats_btn.click(get_statistics, outputs=[stats_display, recent_activity])
+        
+        # Comprehensive Crawler Event Handlers
+        crawler_console_output = ""
+        crawler_status_text = "**Crawler Status:** Stopped"
+        
+        def update_crawler_console(msg):
+            nonlocal crawler_console_output
+            timestamp = datetime.now().strftime("%H:%M:%S")
+            crawler_console_output += f"[{timestamp}] {msg}\n"
+            return crawler_console_output
+        
+        def update_crawler_status(status):
+            nonlocal crawler_status_text
+            crawler_status_text = status
+            return crawler_status_text
+        
+        def start_comprehensive_crawler(max_locations, max_categories, batch_size, crawler_mode, speed_mode):
+            """Start the comprehensive crawler with speed optimization"""
+            global continuous_running, continuous_thread
+            
+            if continuous_running:
+                return "**Crawler Status:** Already running", "⚠️ Crawler is already running\n", "**Queue Stats:** Check above"
+            
+            continuous_running = True
+            update_crawler_console("🚀 Starting comprehensive Craigslist crawler...")
+            update_crawler_console(f"📊 Settings: {max_locations} locations, {max_categories} categories, batch size {batch_size}")
+            update_crawler_console(f"🔧 Mode: {crawler_mode}")
+            update_crawler_console(f"⚡ Speed Mode: {speed_mode}")
+            
+            # Adjust batch size based on speed mode
+            if speed_mode == "SUPER FAST Mode":
+                batch_size = min(batch_size * 2, 50)  # Double batch size for super fast
+                update_crawler_console(f"🚀 SUPER FAST Mode: Increased batch size to {batch_size}")
+            elif speed_mode == "Fast Mode":
+                batch_size = min(batch_size + 10, 40)  # Increase batch size for fast mode
+                update_crawler_console(f"⚡ Fast Mode: Increased batch size to {batch_size}")
+            
+            import threading
+            def run_crawler():
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    if crawler_mode == "Discovery Mode":
+                        loop.run_until_complete(
+                            comprehensive_craigslist_crawl(update_crawler_console, max_locations, max_categories)
+                        )
+                    elif crawler_mode == "Queue Processing":
+                        loop.run_until_complete(
+                            process_url_queue(update_crawler_console, batch_size)
+                        )
+                    else:  # Full Crawl
+                        # First discover URLs
+                        loop.run_until_complete(
+                            comprehensive_craigslist_crawl(update_crawler_console, max_locations, max_categories)
+                        )
+                        # Then process the queue
+                        if continuous_running:
+                            loop.run_until_complete(
+                                process_url_queue(update_crawler_console, batch_size)
+                            )
+                except Exception as e:
+                    update_crawler_console(f"❌ Crawler error: {str(e)}")
+                    update_crawler_status("**Crawler Status:** Error")
+                finally:
+                    loop.close()
+                    update_crawler_status("**Crawler Status:** Stopped")
+            
+            continuous_thread = threading.Thread(target=run_crawler, daemon=True)
+            continuous_thread.start()
+            
+            update_crawler_status("**Crawler Status:** Starting...")
+            stats = get_queue_stats()
+            stats_text = f"**Queue Stats:** {stats['pending']} pending, {stats['scanned']} scanned, {stats['total_emails']} emails found"
+            
+            return crawler_status_text, crawler_console_output, stats_text
+        
+        def stop_comprehensive_crawler():
+            """Stop the comprehensive crawler"""
+            global continuous_running
+            continuous_running = False
+            update_crawler_console("🛑 Stopping crawler...")
+            update_crawler_status("**Crawler Status:** Stopping...")
+            stats = get_queue_stats()
+            stats_text = f"**Queue Stats:** {stats['pending']} pending, {stats['scanned']} scanned, {stats['total_emails']} emails found"
+            return crawler_status_text, crawler_console_output, stats_text
+        
+        def refresh_queue_stats():
+            """Refresh queue statistics"""
+            stats = get_queue_stats()
+            stats_text = f"""**Queue Statistics:**
+- **Total URLs:** {stats['total']}
+- **Pending:** {stats['pending']} 
+- **Scanned:** {stats['scanned']}
+- **Failed:** {stats['failed']}
+- **Total Emails Found:** {stats['total_emails']}"""
+            return stats_text
+        
+        # Connect crawler events
+        start_crawler_btn.click(
+            start_comprehensive_crawler,
+            inputs=[max_locations_slider, max_categories_slider, crawler_batch_size, crawler_mode, speed_mode],
+            outputs=[crawler_status, crawler_console, queue_stats]
+        )
+        
+        stop_crawler_btn.click(
+            stop_comprehensive_crawler,
+            outputs=[crawler_status, crawler_console, queue_stats]
+        )
+        
+        refresh_queue_btn.click(
+            refresh_queue_stats,
+            outputs=[queue_stats]
+        )
         
         # VPN Event Handlers
         def login_with_token(token):
