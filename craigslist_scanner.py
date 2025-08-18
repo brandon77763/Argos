@@ -19,6 +19,8 @@ import subprocess
 import time
 import json
 import random
+from collections import deque
+import builtins
 
 # Configuration
 DB_PATH = "craigslist_emails.db"
@@ -31,6 +33,37 @@ DEFAULT_COLUMNS = ["name", "email", "phone", "post_title", "location", "category
 # Continuous scanning control variables
 continuous_running = False
 continuous_thread = None
+
+# Verbose console: keep only the last 10,000 lines
+VERBOSE_MAX_LINES = 10000
+_verbose_buffer = deque(maxlen=VERBOSE_MAX_LINES)
+
+def verbose_log(message: str):
+    """Append message lines to the global verbose buffer with timestamps."""
+    ts = datetime.now().strftime("%H:%M:%S")
+    # Split incoming text by lines to enforce true line count
+    for line in str(message).splitlines():
+        _verbose_buffer.append(f"[{ts}] {line}")
+
+def get_verbose_text() -> str:
+    """Return the entire verbose buffer as a single string."""
+    return "\n".join(_verbose_buffer)
+
+def clear_verbose_log():
+    """Clear the verbose buffer."""
+    _verbose_buffer.clear()
+
+# Monkey-patch print to also log to the verbose console without recursion
+_original_print = builtins.print
+def _verbose_print(*args, **kwargs):
+    _original_print(*args, **kwargs)
+    try:
+        msg = " ".join(str(a) for a in args)
+        verbose_log(msg)
+    except Exception:
+        # Never let logging crash the app
+        pass
+builtins.print = _verbose_print
 
 # Comprehensive Craigslist crawler data
 CRAIGSLIST_LOCATIONS = [
@@ -1603,8 +1636,35 @@ When enabled, the scanner will automatically change VPN countries every 10-15 se
                         gr.Markdown("#### VPN Installation")
                         install_status = gr.Markdown("**NordVPN CLI:** Checking...")
                         install_btn = gr.Button("📋 Installation Guide", variant="secondary")
+            
+            # Verbose Console Tab
+            with gr.Tab("🧾 Verbose Console"):
+                gr.Markdown("""
+                ### Verbose Console
+                Shows the last 10,000 log lines from the app (most recent last).
+                """)
+                with gr.Row():
+                    refresh_verbose_btn = gr.Button("🔄 Refresh", variant="primary")
+                    clear_verbose_btn = gr.Button("🧹 Clear", variant="secondary")
+                verbose_textbox = gr.Textbox(
+                    value=get_verbose_text(),
+                    label="Logs (tail of 10,000 lines)",
+                    lines=24,
+                    interactive=False,
+                    show_copy_button=True
+                )
         
         # Event handlers
+        def _refresh_verbose():
+            return get_verbose_text()
+
+        def _clear_verbose():
+            clear_verbose_log()
+            return get_verbose_text()
+
+        # Verbose console actions
+        refresh_verbose_btn.click(_refresh_verbose, outputs=[verbose_textbox])
+        clear_verbose_btn.click(_clear_verbose, outputs=[verbose_textbox])
         def run_scan(location, category, keywords, max_results, skip_recent):
             console_output = ""
             
@@ -1653,12 +1713,113 @@ When enabled, the scanner will automatically change VPN countries every 10-15 se
                 return results_table.value, email_count.value
         
         def export_to_csv():
+            """Export current results to a CSV matching the provided sample format.
+
+            Sample columns:
+            First Name, Last Name, Title, Company Name, Email, Phone, Stage, Person Linkedin Url
+            """
             try:
-                data = load_emails_from_db()
+                df = load_emails_from_db()
+
+                # Ensure expected columns exist even if df is empty
+                expected_cols = set(DEFAULT_COLUMNS)
+                for col in (expected_cols - set(df.columns)):
+                    df[col] = ""
+
+                # Helper functions for mapping
+                business_keywords = [
+                    " llc", " inc", " co", " company", " corp", " ltd", " agency", " studio", " group", " services", " solutions"
+                ]
+
+                def is_company(name: str) -> bool:
+                    if not name:
+                        return False
+                    lower = f" {name.strip().lower()}"
+                    return any(k in lower for k in business_keywords)
+
+                def split_name(name: str, fallback_email: str) -> tuple[str, str]:
+                    # Prefer explicit name; otherwise try to infer from email local-part
+                    def _token_split(s: str):
+                        return [t for t in re.split(r"[\s,]+", s.strip()) if t]
+
+                    first, last = "", ""
+                    tokens = _token_split(name) if name else []
+                    if len(tokens) >= 2:
+                        first, last = tokens[0], tokens[-1]
+                    elif len(tokens) == 1:
+                        first = tokens[0]
+                    else:
+                        # Fallback from email
+                        local = (fallback_email or "").split("@")[0].replace(".", " ").replace("_", " ")
+                        tokens = _token_split(local)
+                        if len(tokens) >= 2:
+                            first, last = tokens[0], tokens[-1]
+                        elif len(tokens) == 1:
+                            first = tokens[0]
+                    # Title-case light normalization
+                    return first.title(), last.title()
+
+                def first_value(val: str) -> str:
+                    if not val:
+                        return ""
+                    # Split on common separators and strip
+                    for sep in [",", ";", "|", "/", " "]:
+                        if sep in val:
+                            parts = [p.strip() for p in val.split(sep) if p.strip()]
+                            if parts:
+                                return parts[0]
+                    return val.strip()
+
+                # Build the export rows
+                rows = []
+                for _, r in df.iterrows():
+                    name = str(r.get("name", "") or "").strip()
+                    email_raw = str(r.get("email", "") or "").strip()
+                    phone_raw = str(r.get("phone", "") or "").strip()
+                    title = str(r.get("post_title", "") or "").strip()
+
+                    email = first_value(email_raw)
+                    phone = first_value(phone_raw)
+
+                    company_name = ""
+                    first_name, last_name = "", ""
+
+                    if is_company(name):
+                        company_name = name
+                    else:
+                        first_name, last_name = split_name(name, email)
+
+                    rows.append({
+                        "First Name": first_name,
+                        "Last Name": last_name,
+                        "Title": title,
+                        "Company Name": company_name,
+                        "Email": email,
+                        "Phone": phone,
+                        "Stage": "Cold",  # default stage
+                        "Person Linkedin Url": "",
+                    })
+
+                export_df = pd.DataFrame(rows, columns=[
+                    "First Name",
+                    "Last Name",
+                    "Title",
+                    "Company Name",
+                    "Email",
+                    "Phone",
+                    "Stage",
+                    "Person Linkedin Url",
+                ])
+
+                # Drop duplicate emails if present
+                if not export_df.empty:
+                    export_df.drop_duplicates(subset=["Email"], inplace=True)
+
                 temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".csv")
-                data.to_csv(temp_file.name, index=False)
+                export_df.to_csv(temp_file.name, index=False)
                 return temp_file.name
-            except Exception:
+            except Exception as e:
+                print(f"Error exporting CSV: {e}")
                 return None
         
         def get_statistics():
@@ -2105,11 +2266,12 @@ nordvpn set autoconnect off
             show_installation_guide,
             outputs=[vpn_console]
         )
-        
-        # Initialize components
+
+        # Initialize components (must be inside Blocks context)
         demo.load(refresh_results, outputs=[results_table, email_count])
         demo.load(get_statistics, outputs=[stats_display, recent_activity])
         demo.load(refresh_vpn_status, outputs=[auth_status, vpn_status, current_ip, vpn_console, install_status])
+        demo.load(_refresh_verbose, outputs=[verbose_textbox])
     
     return demo
 
