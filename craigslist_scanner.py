@@ -27,8 +27,8 @@ DB_PATH = "craigslist_emails.db"
 EMAIL_RE = re.compile(r"[a-zA-Z0-9_.+\-]+@[a-zA-Z0-9\-]+\.[a-zA-Z0-9\-.]+")
 PHONE_RE = re.compile(r"(?:\+?\d[\s.-]?)?(?:\(\d{3}\)|\d{3})[\s.-]?\d{3}[\s.-]?\d{4}")
 
-# Default columns for the results table
-DEFAULT_COLUMNS = ["name", "email", "phone", "post_title", "location", "category", "url", "scan_date"]
+# Default columns for the results table - matches CSV export format
+DEFAULT_COLUMNS = ["first_name", "last_name", "title", "company_name", "email", "phone", "stage", "linkedin_url", "location", "category", "url", "scan_date"]
 
 # Continuous scanning control variables
 continuous_running = False
@@ -458,18 +458,24 @@ def init_database():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
-    # Create main emails table
+    # Create main emails table with expanded fields
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS emails (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT,
+            first_name TEXT,
+            last_name TEXT,
+            title TEXT,
+            company_name TEXT,
             email TEXT,
             phone TEXT,
-            post_title TEXT,
+            stage TEXT DEFAULT 'Cold',
+            linkedin_url TEXT DEFAULT '',
             location TEXT,
             category TEXT,
             url TEXT UNIQUE,
-            scan_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            scan_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            raw_name TEXT,
+            raw_post_title TEXT
         )
     ''')
     
@@ -488,8 +494,194 @@ def init_database():
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_url ON emails(url)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_scanned_url ON scanned_urls(url)')
     
+    # Migrate existing data if needed
+    try:
+        # Check if old schema exists
+        cursor.execute("PRAGMA table_info(emails)")
+        columns = [row[1] for row in cursor.fetchall()]
+        
+        if 'name' in columns and 'first_name' not in columns:
+            print("🔄 Migrating database to new schema...")
+            
+            # Add new columns
+            cursor.execute('ALTER TABLE emails ADD COLUMN first_name TEXT DEFAULT ""')
+            cursor.execute('ALTER TABLE emails ADD COLUMN last_name TEXT DEFAULT ""')
+            cursor.execute('ALTER TABLE emails ADD COLUMN title TEXT DEFAULT ""')
+            cursor.execute('ALTER TABLE emails ADD COLUMN company_name TEXT DEFAULT ""')
+            cursor.execute('ALTER TABLE emails ADD COLUMN stage TEXT DEFAULT "Cold"')
+            cursor.execute('ALTER TABLE emails ADD COLUMN linkedin_url TEXT DEFAULT ""')
+            cursor.execute('ALTER TABLE emails ADD COLUMN raw_name TEXT DEFAULT ""')
+            cursor.execute('ALTER TABLE emails ADD COLUMN raw_post_title TEXT DEFAULT ""')
+            
+            # Migrate existing data
+            cursor.execute('SELECT id, name, post_title FROM emails WHERE name IS NOT NULL')
+            records = cursor.fetchall()
+            
+            for record_id, name, post_title in records:
+                # Parse name into first/last name and company
+                first_name, last_name, company_name = parse_contact_name(name or "")
+                
+                # Update record with parsed data
+                cursor.execute('''
+                    UPDATE emails 
+                    SET first_name = ?, last_name = ?, title = ?, company_name = ?, raw_name = ?, raw_post_title = ?
+                    WHERE id = ?
+                ''', (first_name, last_name, post_title or "", company_name, name or "", post_title or "", record_id))
+            
+            print(f"✅ Migrated {len(records)} existing records")
+    
+    except Exception as e:
+        print(f"⚠️ Migration warning: {e}")
+    
     conn.commit()
     conn.close()
+
+def parse_contact_name(raw_name):
+    """Parse raw name into first_name, last_name, and company_name"""
+    if not raw_name:
+        return "", "", ""
+    
+    raw_name = raw_name.strip()
+    
+    # Enhanced business keywords for company detection
+    business_keywords = [
+        " llc", " inc", " co", " company", " corp", " ltd", " agency", " studio", 
+        " group", " services", " solutions", " enterprises", " consulting", " design",
+        " photography", " construction", " cleaning", " landscaping", " catering",
+        " automotive", " repair", " maintenance", " technologies", " tech", " systems"
+    ]
+    
+    business_indicators = [
+        "& associates", "and associates", "& co", "and co", "& sons", "and sons",
+        "contractors", "contract", "professional", "specialists", "experts"
+    ]
+    
+    # Check if it's a company
+    lower_name = f" {raw_name.lower()} "
+    if any(keyword in lower_name for keyword in business_keywords):
+        return "", "", raw_name
+    
+    if any(indicator in lower_name for indicator in business_indicators):
+        return "", "", raw_name
+    
+    # Split into tokens
+    tokens = [t for t in re.split(r"[\s,]+", raw_name) if t and len(t) > 1]
+    
+    if len(tokens) >= 2:
+        first_name = tokens[0].title()
+        last_name = tokens[-1].title()
+        return first_name, last_name, ""
+    elif len(tokens) == 1:
+        first_name = tokens[0].title()
+        return first_name, "", ""
+    
+    return "", "", ""
+
+def extract_names_from_content(text_content, post_title=""):
+    """Enhanced name extraction from post content"""
+    names_found = []
+    companies_found = []
+    
+    # Clean up text
+    lines = text_content.split('\n')
+    
+    # Look for contact patterns
+    contact_patterns = [
+        r"contact\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)",
+        r"call\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)",
+        r"ask\s+for\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)",
+        r"speak\s+(?:with|to)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)",
+        r"my\s+name\s+is\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)",
+        r"i'm\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)",
+        r"(?:hi|hello),?\s+(?:i'm|this\s+is)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)"
+    ]
+    
+    # Company patterns
+    company_patterns = [
+        r"([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\s+(?:LLC|Inc|Co|Company|Corp|Ltd|Agency|Studio|Group|Services|Solutions)",
+        r"([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\s+(?:Photography|Construction|Cleaning|Landscaping|Catering|Automotive|Repair|Maintenance)",
+        r"([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\s+(?:& Associates|and Associates|& Co|and Co|Contractors|Professional|Specialists)"
+    ]
+    
+    full_text = text_content.lower()
+    
+    # Extract names using patterns
+    for pattern in contact_patterns:
+        matches = re.findall(pattern, text_content, re.IGNORECASE)
+        for match in matches:
+            if 2 <= len(match) <= 30 and not any(spam in match.lower() for spam in ['call now', 'click here', 'visit', 'www', 'http']):
+                names_found.append(match.strip())
+    
+    # Extract companies using patterns
+    for pattern in company_patterns:
+        matches = re.findall(pattern, text_content, re.IGNORECASE)
+        for match in matches:
+            if 2 <= len(match) <= 50:
+                companies_found.append(match.strip())
+    
+    # Look in first few lines for names/companies
+    for i, line in enumerate(lines[:8]):
+        line = line.strip()
+        if 3 <= len(line) <= 50 and not line.isupper():
+            # Skip obvious spam lines
+            if any(spam in line.lower() for spam in ['call now', 'click here', 'visit', 'www', 'http', '$', 'free', 'deal']):
+                continue
+            
+            # Check if line looks like a name
+            tokens = line.split()
+            if len(tokens) == 2 and all(token[0].isupper() and token[1:].islower() for token in tokens):
+                names_found.append(line)
+            elif any(biz in line.lower() for biz in ['llc', 'inc', 'company', 'services', 'solutions', 'group']):
+                companies_found.append(line)
+    
+    # Also check post title for company names
+    if post_title:
+        title_lower = post_title.lower()
+        if any(biz in title_lower for biz in ['llc', 'inc', 'company', 'services', 'solutions', 'group', 'photography', 'cleaning', 'construction']):
+            # Extract potential company name from title
+            title_parts = post_title.split(' - ')
+            if title_parts:
+                potential_company = title_parts[0].strip()
+                if 5 <= len(potential_company) <= 50:
+                    companies_found.append(potential_company)
+    
+    return names_found, companies_found
+
+def parse_email_for_name(email):
+    """Extract potential name from email local part as fallback"""
+    if not email or "@" not in email:
+        return "", ""
+    
+    local_part = email.split("@")[0]
+    # Replace common separators with spaces
+    name_guess = local_part.replace(".", " ").replace("_", " ").replace("-", " ")
+    
+    tokens = [t for t in re.split(r"[\s,]+", name_guess) if t and len(t) > 1]
+    
+    if len(tokens) >= 2:
+        return tokens[0].title(), tokens[-1].title()
+    elif len(tokens) == 1:
+        return tokens[0].title(), ""
+    
+    return "", ""
+
+def save_email_to_db(email_data):
+    """Save a single email record to database with parsed fields"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT OR REPLACE INTO emails (
+                first_name, last_name, title, company_name, email, phone, 
+                stage, linkedin_url, location, category, url, scan_date, 
+                raw_name, raw_post_title
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', email_data)
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"Error saving email: {e}")
 
 def load_emails_from_db():
     """Load all emails from database"""
@@ -499,23 +691,15 @@ def load_emails_from_db():
         conn.close()
         if df.empty:
             return pd.DataFrame(columns=DEFAULT_COLUMNS)
+        
+        # Ensure all expected columns exist
+        for col in DEFAULT_COLUMNS:
+            if col not in df.columns:
+                df[col] = ""
+        
         return df[DEFAULT_COLUMNS].fillna("")
     except Exception:
         return pd.DataFrame(columns=DEFAULT_COLUMNS)
-
-def save_email_to_db(email_data):
-    """Save a single email record to database"""
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute('''
-            INSERT OR REPLACE INTO emails (name, email, phone, post_title, location, category, url, scan_date)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ''', email_data)
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        print(f"Error saving email: {e}")
 
 def is_url_recently_scanned(url, hours=24):
     """Check if URL was scanned recently"""
@@ -782,7 +966,7 @@ async def extract_emails_from_post(url, title="", max_retries=3):
                     category = "writing/editing/translation"
                 
                 # Extract name (try to find business/person name)
-                name = ""
+                raw_name = ""
                 
                 # Look for name patterns in the text
                 lines = text_content.split('\n')
@@ -791,24 +975,42 @@ async def extract_emails_from_post(url, title="", max_retries=3):
                     if len(line) > 3 and len(line) < 50:
                         # Skip lines that are all caps or look like spam
                         if not line.isupper() and not any(spam in line.lower() for spam in ['call now', 'click here', 'visit']):
-                            name = line
+                            raw_name = line
                             break
                 
-                if not name and title:
-                    name = title.split(' - ')[0].strip()[:50]
+                if not raw_name and title:
+                    raw_name = title.split(' - ')[0].strip()[:50]
+                
+                # Parse name into structured fields
+                first_name, last_name, company_name = parse_contact_name(raw_name)
+                
+                # If no name found, try to infer from email
+                if not first_name and not last_name and not company_name:
+                    email_first = emails[0] if emails else ""
+                    first_name, last_name = parse_email_for_name(email_first)
+                
+                # Extract first email and phone for single values
+                single_email = emails[0] if emails else ""
+                single_phone = phones[0] if phones else ""
                 
                 # Reset network error count on successful extraction
                 await rotate_vpn_if_needed(is_network_error=False)
                 
                 return {
-                    'name': name,
-                    'email': ', '.join(emails[:3]),  # Limit to 3 emails
-                    'phone': ', '.join(phones[:2]),  # Limit to 2 phones
-                    'post_title': title,
+                    'first_name': first_name,
+                    'last_name': last_name,
+                    'title': title,
+                    'company_name': company_name,
+                    'email': single_email,
+                    'phone': single_phone,
+                    'stage': 'Cold',
+                    'linkedin_url': '',
                     'location': location,
                     'category': category,
                     'url': url,
-                    'scan_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    'scan_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    'raw_name': raw_name,
+                    'raw_post_title': title
                 }
                 
         except (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError) as e:
@@ -922,9 +1124,17 @@ async def scan_craigslist_for_emails(location, category, keywords, max_results, 
                     
                     if email_data and email_data['email']:
                         email_records.append(email_data)
-                        save_email_to_db(tuple(email_data[col] for col in DEFAULT_COLUMNS))
-                        emails_found = len(email_data['email'].split(','))
-                        log(f"✅ Found {emails_found} emails in post {post_num}")
+                        # Convert to tuple format for database saving
+                        db_tuple = (
+                            email_data['first_name'], email_data['last_name'], email_data['title'],
+                            email_data['company_name'], email_data['email'], email_data['phone'],
+                            email_data['stage'], email_data['linkedin_url'], email_data['location'],
+                            email_data['category'], email_data['url'], email_data['scan_date'],
+                            email_data['raw_name'], email_data['raw_post_title']
+                        )
+                        save_email_to_db(db_tuple)
+                        emails_found = 1
+                        log(f"✅ Found email in post {post_num}")
                     
                     record_scanned_url(post['url'], emails_found)
                     processed += 1
@@ -945,8 +1155,16 @@ async def scan_craigslist_for_emails(location, category, keywords, max_results, 
                     emails_found = 0
                     if email_data and email_data['email']:
                         email_records.append(email_data)
-                        save_email_to_db(tuple(email_data[col] for col in DEFAULT_COLUMNS))
-                        emails_found = len(email_data['email'].split(','))
+                        # Convert to tuple format for database saving
+                        db_tuple = (
+                            email_data['first_name'], email_data['last_name'], email_data['title'],
+                            email_data['company_name'], email_data['email'], email_data['phone'],
+                            email_data['stage'], email_data['linkedin_url'], email_data['location'],
+                            email_data['category'], email_data['url'], email_data['scan_date'],
+                            email_data['raw_name'], email_data['raw_post_title']
+                        )
+                        save_email_to_db(db_tuple)
+                        emails_found = 1
                     record_scanned_url(post['url'], emails_found)
                     processed += 1
                 except Exception as inner_e:
@@ -1227,9 +1445,16 @@ async def process_url_queue(progress_callback=None, batch_size=10):
                 emails_found = 0
                 if email_data and email_data['email']:
                     # Save to database
-                    save_email_to_db(tuple(email_data[col] for col in DEFAULT_COLUMNS))
-                    emails_found = len(email_data['email'].split(','))
-                    log(f"✅ Found {emails_found} emails")
+                    db_tuple = (
+                        email_data['first_name'], email_data['last_name'], email_data['title'],
+                        email_data['company_name'], email_data['email'], email_data['phone'],
+                        email_data['stage'], email_data['linkedin_url'], email_data['location'],
+                        email_data['category'], email_data['url'], email_data['scan_date'],
+                        email_data['raw_name'], email_data['raw_post_title']
+                    )
+                    save_email_to_db(db_tuple)
+                    emails_found = 1
+                    log(f"✅ Found email")
                 
                 # Mark as scanned
                 mark_url_scanned(url_id, emails_found)
@@ -1539,7 +1764,7 @@ def create_interface():
                 
                 results_table = gr.Dataframe(
                     value=load_emails_from_db(),
-                    headers=DEFAULT_COLUMNS,
+                    headers=["First Name", "Last Name", "Title", "Company Name", "Email", "Phone", "Stage", "LinkedIn URL", "Location", "Category", "URL", "Scan Date"],
                     interactive=True,
                     wrap=True,
                     datatype=["str"] * len(DEFAULT_COLUMNS)
@@ -1713,104 +1938,29 @@ When enabled, the scanner will automatically change VPN countries every 10-15 se
                 return results_table.value, email_count.value
         
         def export_to_csv():
-            """Export current results to a CSV matching the provided sample format.
-
-            Sample columns:
-            First Name, Last Name, Title, Company Name, Email, Phone, Stage, Person Linkedin Url
-            """
+            """Export current results to a CSV matching the sample format."""
             try:
                 df = load_emails_from_db()
-
-                # Ensure expected columns exist even if df is empty
-                expected_cols = set(DEFAULT_COLUMNS)
-                for col in (expected_cols - set(df.columns)):
-                    df[col] = ""
-
-                # Helper functions for mapping
-                business_keywords = [
-                    " llc", " inc", " co", " company", " corp", " ltd", " agency", " studio", " group", " services", " solutions"
-                ]
-
-                def is_company(name: str) -> bool:
-                    if not name:
-                        return False
-                    lower = f" {name.strip().lower()}"
-                    return any(k in lower for k in business_keywords)
-
-                def split_name(name: str, fallback_email: str) -> tuple[str, str]:
-                    # Prefer explicit name; otherwise try to infer from email local-part
-                    def _token_split(s: str):
-                        return [t for t in re.split(r"[\s,]+", s.strip()) if t]
-
-                    first, last = "", ""
-                    tokens = _token_split(name) if name else []
-                    if len(tokens) >= 2:
-                        first, last = tokens[0], tokens[-1]
-                    elif len(tokens) == 1:
-                        first = tokens[0]
-                    else:
-                        # Fallback from email
-                        local = (fallback_email or "").split("@")[0].replace(".", " ").replace("_", " ")
-                        tokens = _token_split(local)
-                        if len(tokens) >= 2:
-                            first, last = tokens[0], tokens[-1]
-                        elif len(tokens) == 1:
-                            first = tokens[0]
-                    # Title-case light normalization
-                    return first.title(), last.title()
-
-                def first_value(val: str) -> str:
-                    if not val:
-                        return ""
-                    # Split on common separators and strip
-                    for sep in [",", ";", "|", "/", " "]:
-                        if sep in val:
-                            parts = [p.strip() for p in val.split(sep) if p.strip()]
-                            if parts:
-                                return parts[0]
-                    return val.strip()
-
-                # Build the export rows
-                rows = []
-                for _, r in df.iterrows():
-                    name = str(r.get("name", "") or "").strip()
-                    email_raw = str(r.get("email", "") or "").strip()
-                    phone_raw = str(r.get("phone", "") or "").strip()
-                    title = str(r.get("post_title", "") or "").strip()
-
-                    email = first_value(email_raw)
-                    phone = first_value(phone_raw)
-
-                    company_name = ""
-                    first_name, last_name = "", ""
-
-                    if is_company(name):
-                        company_name = name
-                    else:
-                        first_name, last_name = split_name(name, email)
-
-                    rows.append({
-                        "First Name": first_name,
-                        "Last Name": last_name,
-                        "Title": title,
-                        "Company Name": company_name,
-                        "Email": email,
-                        "Phone": phone,
-                        "Stage": "Cold",  # default stage
-                        "Person Linkedin Url": "",
+                
+                if df.empty:
+                    # Create empty DataFrame with correct columns
+                    export_df = pd.DataFrame(columns=[
+                        "First Name", "Last Name", "Title", "Company Name", 
+                        "Email", "Phone", "Stage", "Person Linkedin Url"
+                    ])
+                else:
+                    # Map database columns to export format
+                    export_df = pd.DataFrame({
+                        "First Name": df['first_name'],
+                        "Last Name": df['last_name'],
+                        "Title": df['title'],
+                        "Company Name": df['company_name'],
+                        "Email": df['email'],
+                        "Phone": df['phone'],
+                        "Stage": df['stage'],
+                        "Person Linkedin Url": df['linkedin_url']
                     })
-
-                export_df = pd.DataFrame(rows, columns=[
-                    "First Name",
-                    "Last Name",
-                    "Title",
-                    "Company Name",
-                    "Email",
-                    "Phone",
-                    "Stage",
-                    "Person Linkedin Url",
-                ])
-
+                
                 # Drop duplicate emails if present
                 if not export_df.empty:
                     export_df.drop_duplicates(subset=["Email"], inplace=True)
