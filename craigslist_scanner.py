@@ -918,6 +918,51 @@ async def extract_emails_from_post(url, title="", max_retries=3):
                 # Extract phones
                 phones = PHONE_RE.findall(text_content)
                 
+                # Enhanced name and company extraction
+                names_found, companies_found = extract_names_from_content(text_content, title)
+                
+                # Determine the best name and company
+                best_name = ""
+                best_company = ""
+                
+                # Prioritize companies if found
+                if companies_found:
+                    best_company = companies_found[0]  # Take the first/best company match
+                
+                # If no company, look for names
+                if names_found and not best_company:
+                    best_name = names_found[0]  # Take the first/best name match
+                
+                # Fallback: try to extract from first few lines (original logic)
+                if not best_name and not best_company:
+                    lines = text_content.split('\n')
+                    for line in lines[:5]:
+                        line = line.strip()
+                        if 3 <= len(line) <= 50 and not line.isupper():
+                            if not any(spam in line.lower() for spam in ['call now', 'click here', 'visit', 'www', 'http', '$']):
+                                best_name = line
+                                break
+                
+                # Final fallback: use title
+                if not best_name and not best_company and title:
+                    best_name = title.split(' - ')[0].strip()[:50]
+                
+                # Parse the best name/company found
+                first_name, last_name, company_name = "", "", ""
+                
+                if best_company:
+                    company_name = best_company
+                elif best_name:
+                    first_name, last_name, potential_company = parse_contact_name(best_name)
+                    if potential_company:
+                        company_name = potential_company
+                        first_name, last_name = "", ""
+                
+                # If still no name, try to infer from email
+                if not first_name and not last_name and not company_name:
+                    email_first = emails[0] if emails else ""
+                    first_name, last_name = parse_email_for_name(email_first)
+                
                 # Extract location from URL or page
                 location = ""
                 try:
@@ -965,30 +1010,6 @@ async def extract_emails_from_post(url, title="", max_retries=3):
                 elif '/wet/' in url:
                     category = "writing/editing/translation"
                 
-                # Extract name (try to find business/person name)
-                raw_name = ""
-                
-                # Look for name patterns in the text
-                lines = text_content.split('\n')
-                for line in lines[:5]:  # Check first few lines
-                    line = line.strip()
-                    if len(line) > 3 and len(line) < 50:
-                        # Skip lines that are all caps or look like spam
-                        if not line.isupper() and not any(spam in line.lower() for spam in ['call now', 'click here', 'visit']):
-                            raw_name = line
-                            break
-                
-                if not raw_name and title:
-                    raw_name = title.split(' - ')[0].strip()[:50]
-                
-                # Parse name into structured fields
-                first_name, last_name, company_name = parse_contact_name(raw_name)
-                
-                # If no name found, try to infer from email
-                if not first_name and not last_name and not company_name:
-                    email_first = emails[0] if emails else ""
-                    first_name, last_name = parse_email_for_name(email_first)
-                
                 # Extract first email and phone for single values
                 single_email = emails[0] if emails else ""
                 single_phone = phones[0] if phones else ""
@@ -1009,7 +1030,7 @@ async def extract_emails_from_post(url, title="", max_retries=3):
                     'category': category,
                     'url': url,
                     'scan_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                    'raw_name': raw_name,
+                    'raw_name': best_company or best_name,
                     'raw_post_title': title
                 }
                 
