@@ -203,10 +203,17 @@ def add_urls_to_queue(urls_data, location="", category=""):
     if super_verbose_mode:
         print(f"🔍 SUPER VERBOSE: add_urls_to_queue called with {len(urls_data)} URLs for {location}/{category}")
 
+    # Additional debug: print first few URLs being processed
+    if len(urls_data) > 0:
+        sample_urls = [url_data.get('url', 'NO_URL') for url_data in urls_data[:3]]
+        print(f"🔍 DEBUG: Sample URLs to add: {sample_urls}")
+
     added_count = 0
     for url_data in urls_data:
         try:
             url = url_data['url']
+            
+            print(f"🔍 DEBUG: Processing URL: {url}")  # Debug every URL
             
             # Super verbose logging
             if super_verbose_mode:
@@ -268,12 +275,16 @@ def add_urls_to_queue(urls_data, location="", category=""):
                     added_count += 1
                     
         except sqlite3.Error as e:
+            print(f"🔍 DEBUG: Database error adding URL {url_data.get('url', 'unknown')}: {e}")
             if super_verbose_mode:
                 print(f"🔍 SUPER VERBOSE: Database error adding URL {url_data.get('url', 'unknown')}: {e}")
             continue
     
+    print(f"🔍 DEBUG: About to commit {added_count} URLs to database")
     conn.commit()
     conn.close()
+    
+    print(f"🔍 DEBUG: Database commit completed for {added_count} URLs")
     
     # Enhanced debug logging
     if super_verbose_mode:
