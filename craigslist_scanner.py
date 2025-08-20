@@ -267,37 +267,51 @@ def mark_url_scanned(url_id, emails_found=0, error=None):
 
 def get_queue_stats():
     """Get URL queue statistics"""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    
-    cursor.execute('''
-        SELECT 
-            COUNT(*) as total,
-            SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) as pending,
-            SUM(CASE WHEN status = 'scanned' THEN 1 ELSE 0 END) as scanned,
-            SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed,
-            SUM(emails_found) as total_emails
-        FROM url_queue
-    ''')
-    
-    stats = cursor.fetchone()
-    conn.close()
-    return {
-        'total': stats[0] or 0,
-        'pending': stats[1] or 0,
-        'scanned': stats[2] or 0,
-        'failed': stats[3] or 0,
-        'total_emails': stats[4] or 0
-    }
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            SELECT 
+                COUNT(*) as total,
+                SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) as pending,
+                SUM(CASE WHEN status = 'scanned' THEN 1 ELSE 0 END) as scanned,
+                SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed,
+                SUM(emails_found) as total_emails
+            FROM url_queue
+        ''')
+        
+        stats = cursor.fetchone()
+        conn.close()
+        return {
+            'total': stats[0] or 0,
+            'pending': stats[1] or 0,
+            'scanned': stats[2] or 0,
+            'failed': stats[3] or 0,
+            'total_emails': stats[4] or 0
+        }
+    except Exception as e:
+        print(f"Error getting queue stats: {e}")
+        return {
+            'total': 0,
+            'pending': 0,
+            'scanned': 0,
+            'failed': 0,
+            'total_emails': 0
+        }
 
 def get_email_count():
     """Get total count of emails found"""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute('SELECT COUNT(*) FROM emails')
-    count = cursor.fetchone()[0]
-    conn.close()
-    return count or 0
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute('SELECT COUNT(*) FROM emails')
+        count = cursor.fetchone()[0]
+        conn.close()
+        return count or 0
+    except Exception as e:
+        print(f"Error getting email count: {e}")
+        return 0
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
@@ -643,7 +657,7 @@ def init_optimization_database():
         # Insert default settings if not exists
         cursor.execute('''
             INSERT OR IGNORE INTO optimization_settings (id, auto_optimize, target_urls_per_second, max_batch_size, max_threads)
-            VALUES (1, 1, 15.0, 100, 50)
+            VALUES (1, 1, 5.0, 10, 5)
         ''')
         
         conn.commit()
@@ -675,12 +689,12 @@ def get_optimization_settings():
         else:
             return {
                 'auto_optimize': True,
-                'target_urls_per_second': 15.0,
-                'max_batch_size': 100,
-                'max_threads': 50,
-                'min_batch_size': 10,
-                'min_threads': 5,
-                'optimization_interval': 10
+                'target_urls_per_second': 5.0,  # Reduced from 15.0 for better rate limit management
+                'max_batch_size': 10,  # Reduced from 100
+                'max_threads': 5,  # Reduced from 50
+                'min_batch_size': 3,  # Reduced from 10
+                'min_threads': 2,  # Reduced from 5
+                'optimization_interval': 15  # Increased from 10 for more conservative optimization
             }
     except Exception as e:
         print(f"Error getting optimization settings: {e}")
@@ -1140,7 +1154,7 @@ async def rotate_vpn_if_needed(force_rotate=False, is_network_error=False):
         consecutive_network_errors = max(0, consecutive_network_errors - 1)
     
     # Only rotate for actual network blocks, not HTTP status codes
-    should_rotate = force_rotate or consecutive_network_errors >= 5  # Increased threshold
+    should_rotate = force_rotate or consecutive_network_errors >= 3  # Reduced from 5 to 3 for more aggressive rotation
     
     if not should_rotate:
         return True, last_ip_check or vpn_manager.get_current_ip()
@@ -1384,9 +1398,17 @@ async def extract_emails_from_post(url, title="", max_retries=3):
                 
         except Exception as e:
             error_msg = str(e)
-            if attempt < max_retries - 1:
+            # Check if this is an HTTP client error that might indicate blocking
+            is_client_error = "HTTP client error" in error_msg or "403" in error_msg or "429" in error_msg or "503" in error_msg
+            
+            if is_client_error and attempt < max_retries - 1:
+                print(f"⚠️ HTTP client error for {url}: {error_msg} - rotating VPN and retrying...")
+                await rotate_vpn_if_needed(is_network_error=True)
+                await asyncio.sleep(3.0)  # Longer delay for client errors
+                continue
+            elif attempt < max_retries - 1:
                 print(f"⚠️ Error extracting from {url}: {error_msg}, retrying...")
-                await asyncio.sleep(0.2)  # Reduced from 0.5 to 0.2 seconds
+                await asyncio.sleep(0.5)  # Increased delay slightly
                 continue
             else:
                 print(f"❌ Failed to extract from {url} after {max_retries} attempts: {error_msg}")
@@ -1442,10 +1464,10 @@ async def scan_craigslist_for_emails(location, category, keywords, max_results, 
     if vpn_manager.is_authenticated:
         await rotate_vpn_if_needed(force_rotate=True)
     
-    # Extract emails from posts with ULTRA FAST parallel processing
+    # Extract emails from posts with conservative parallel processing to avoid rate limits
     email_records = []
     processed = 0
-    batch_size = 50  # Increased from 20 to 50 for ULTRA FAST processing
+    batch_size = 5  # Reduced from 50 to 5 for better rate limit management
     
     for i in range(0, len(posts), batch_size):
         batch = posts[i:i + batch_size]
@@ -1497,8 +1519,8 @@ async def scan_craigslist_for_emails(location, category, keywords, max_results, 
                     log(f"❌ Error processing result {post_num}: {e}")
                     continue
             
-            # ULTRA FAST - no delays between batches for maximum speed
-            # await asyncio.sleep(0.1)  # Commented out for ultra speed
+            # Add delay between batches to avoid rate limiting and respect servers
+            await asyncio.sleep(2.0)  # 2 second delay between batches to prevent overwhelming servers
                 
         except Exception as e:
             log(f"❌ Error in batch processing: {e}")
@@ -1765,13 +1787,13 @@ async def comprehensive_craigslist_crawl(progress_callback=None, max_locations=1
                 log(f"❌ Error crawling {location}/{category}: {str(e)}")
                 continue
         
-        # ULTRA FAST - minimal rate limiting between locations  
-        await asyncio.sleep(0.2)  # Reduced from 1 to 0.2 seconds
+        # Rate limiting between locations to avoid overwhelming servers
+        await asyncio.sleep(1.0)  # Increased from 0.2 to 1.0 seconds
     
     log(f"🎉 Crawl complete! Discovered {total_discovered} new URLs")
     return total_discovered
 
-async def process_url_queue(progress_callback=None, batch_size=10, max_cycles=10):
+async def process_url_queue(progress_callback=None, batch_size=5, max_cycles=10):
     """Process URLs from the queue systematically with multiple processing cycles"""
     
     def log(msg):
@@ -2347,6 +2369,7 @@ def create_interface():
                                 value=True,
                                 info="Keep output updated automatically"
                             )
+                            manual_refresh_btn = gr.Button("🔄 Manual Refresh", size="sm", variant="secondary")
                             super_verbose = gr.Checkbox(
                                 label="🔍 Super Verbose Mode",
                                 value=False,
@@ -2373,23 +2396,7 @@ def create_interface():
                     export_csv = gr.Button("📄 Export CSV")
                     download_file = gr.File(label="Download", interactive=False)
             
-            with gr.Tab("📊 Statistics"):
-                with gr.Column():
-                    stats_display = gr.Markdown("### Scanning Statistics\nLoading...")
-                    
-                    gr.Markdown("### Recent Activity")
-                    recent_activity = gr.Dataframe(
-                        headers=["URL", "Scan Date", "Emails Found"],
-                        interactive=False
-                    )
-                    
-                    with gr.Row():
-                        refresh_stats_btn = gr.Button("🔄 Refresh Statistics")
-                        cleanup_btn = gr.Button("🧹 Clean Old URLs (>7 days)", variant="secondary")
-                    
-                    cleanup_status = gr.Markdown("")
-            
-            with gr.Tab("🔒 VPN Control"):
+            with gr.Tab(" VPN Control"):
                 gr.Markdown("### NordVPN Integration\nManage VPN connections for anonymous scanning and rate limit avoidance.")
                 
                 with gr.Row():
@@ -2567,104 +2574,12 @@ When enabled, the scanner will automatically change VPN countries every 10-15 se
                 print(f"Error exporting CSV: {e}")
                 return None
         
-        def get_statistics():
-            try:
-                conn = sqlite3.connect(DB_PATH)
-                
-                # Get overall stats
-                cursor = conn.cursor()
-                cursor.execute('SELECT COUNT(*) FROM emails')
-                total_emails = cursor.fetchone()[0]
-                
-                cursor.execute('SELECT COUNT(DISTINCT url) FROM emails')
-                unique_posts = cursor.fetchone()[0]
-                
-                cursor.execute("SELECT COUNT(*) FROM emails WHERE scan_date > datetime('now', '-24 hours')")
-                recent_emails = cursor.fetchone()[0]
-                
-                # Get total scanned from both tables
-                cursor.execute('SELECT COUNT(*) FROM scanned_urls')
-                scanned_urls_count = cursor.fetchone()[0]
-                
-                cursor.execute("SELECT COUNT(*) FROM url_queue WHERE status = 'scanned'")
-                queue_scanned_count = cursor.fetchone()[0]
-                
-                total_scanned = scanned_urls_count + queue_scanned_count
-                
-                # Get queue statistics
-                cursor.execute('''
-                    SELECT 
-                        COUNT(*) as total,
-                        SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) as pending,
-                        SUM(CASE WHEN status = 'scanned' THEN 1 ELSE 0 END) as scanned,
-                        SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed,
-                        COALESCE(SUM(emails_found), 0) as queue_emails
-                    FROM url_queue
-                ''')
-                queue_stats = cursor.fetchone()
-                
-                # Get recent activity from both tables
-                cursor.execute('''
-                    SELECT url, scan_date, emails_found, 'regular' as source
-                    FROM scanned_urls 
-                    WHERE scan_date IS NOT NULL
-                    UNION ALL
-                    SELECT url, scanned_date, emails_found, 'crawler' as source
-                    FROM url_queue 
-                    WHERE status = 'scanned' AND scanned_date IS NOT NULL
-                    ORDER BY scan_date DESC 
-                    LIMIT 20
-                ''')
-                recent_data = cursor.fetchall()
-                
-                conn.close()
-                
-                # Calculate success rate
-                success_rate = (unique_posts/max(total_scanned,1)*100) if total_scanned > 0 else 0
-                
-                stats_text = f"""### Scanning Statistics
-- **Total Emails Found:** {total_emails}
-- **Unique Posts Scanned:** {unique_posts}
-- **Emails Found (24h):** {recent_emails}
-- **Total URLs Scanned:** {total_scanned}
-- **Success Rate:** {success_rate:.1f}%
-
-### Crawler Queue Statistics
-- **Total URLs in Queue:** {queue_stats[0] if queue_stats else 0}
-- **Pending URLs:** {queue_stats[1] if queue_stats else 0}
-- **Scanned URLs:** {queue_stats[2] if queue_stats else 0}
-- **Failed URLs:** {queue_stats[3] if queue_stats else 0}
-- **Queue Emails Found:** {queue_stats[4] if queue_stats else 0}"""
-                
-                recent_df = pd.DataFrame(recent_data, columns=["URL", "Scan Date", "Emails Found", "Source"])
-                
-                return stats_text, recent_df
-                
-            except Exception as e:
-                return f"### Statistics\n**Error loading stats:** {str(e)}", pd.DataFrame()
         
         # Connect event handlers for results and stats
         refresh_btn.click(refresh_results, outputs=[results_table, email_count])
         clear_btn.click(clear_all_results, outputs=[results_table, email_count])
         fix_companies_btn.click(fix_company_names_ui, outputs=[results_table, email_count, fix_status])
         export_csv.click(export_to_csv, outputs=[download_file])
-        refresh_stats_btn.click(get_statistics, outputs=[stats_display, recent_activity])
-        
-        # Cleanup old URLs event handler
-        def cleanup_old_urls_ui():
-            try:
-                deleted_count = cleanup_old_scanned_urls(7)
-                status_msg = f"✅ Cleaned up {deleted_count} old URLs (>7 days) for better performance!"
-                # Refresh stats after cleanup
-                stats, activity = get_statistics()
-                return stats, activity, status_msg
-            except Exception as e:
-                return "Error occurred during cleanup", [], f"❌ Error: {str(e)}"
-        
-        cleanup_btn.click(
-            cleanup_old_urls_ui, 
-            outputs=[stats_display, recent_activity, cleanup_status]
-        )
         
         # Comprehensive Crawler Event Handlers
         crawler_console_output = ""
@@ -2697,13 +2612,13 @@ When enabled, the scanner will automatically change VPN countries every 10-15 se
             if crawler_mode == "Auto-Repeat Crawl":
                 update_crawler_console(f"🔄 Auto-Repeat: {urls_per_cycle} URLs per cycle, max {max_repeat_cycles} cycles")
             
-            # Adjust batch size based on speed mode
+            # Adjust batch size based on speed mode (reduced for better rate limit management)
             if speed_mode == "ULTRA FAST Mode":
-                batch_size = min(batch_size * 3, 100)  # Triple batch size for ultra fast
-                update_crawler_console(f"🚀 ULTRA FAST Mode: Increased batch size to {batch_size}")
+                batch_size = min(batch_size + 5, 10)  # Conservative increase for ultra fast
+                update_crawler_console(f"🚀 ULTRA FAST Mode: Increased batch size to {batch_size} (conservative)")
             elif speed_mode == "Fast Mode":
-                batch_size = min(batch_size + 10, 40)  # Increase batch size for fast mode
-                update_crawler_console(f"⚡ Fast Mode: Increased batch size to {batch_size}")
+                batch_size = min(batch_size + 2, 8)  # Small increase for fast mode
+                update_crawler_console(f"⚡ Fast Mode: Increased batch size to {batch_size} (conservative)")
             
             import threading
             def run_crawler():
@@ -2827,33 +2742,37 @@ When enabled, the scanner will automatically change VPN countries every 10-15 se
         
         def get_auto_stats():
             """Get quick stats for auto repeat crawler"""
-            stats = get_queue_stats()
-            emails = get_email_count()
-            
-            # Get recent activity count
-            conn = sqlite3.connect(DB_PATH)
-            cursor = conn.cursor()
-            cursor.execute('''
-                SELECT COUNT(*) FROM (
-                    SELECT email FROM emails WHERE scan_date >= datetime('now', '-1 hour')
-                    UNION
-                    SELECT url FROM url_queue WHERE scanned_date >= datetime('now', '-1 hour') AND emails_found > 0
-                )
-            ''')
-            recent_activity = cursor.fetchone()[0] or 0
-            conn.close()
-            
-            status_emoji = "🚀" if continuous_running else "⏹️"
-            status_text = "Active" if continuous_running else "Stopped"
-            total_scanned = stats['scanned']
-            
-            return f"""**Quick Stats:**
+            try:
+                stats = get_queue_stats()
+                emails = get_email_count()
+                
+                # Get recent activity count
+                conn = sqlite3.connect(DB_PATH)
+                cursor = conn.cursor()
+                cursor.execute('''
+                    SELECT COUNT(*) FROM (
+                        SELECT email FROM emails WHERE scan_date >= datetime('now', '-1 hour')
+                        UNION
+                        SELECT url FROM url_queue WHERE scanned_date >= datetime('now', '-1 hour') AND emails_found > 0
+                    )
+                ''')
+                recent_activity = cursor.fetchone()[0] or 0
+                conn.close()
+                
+                status_emoji = "🚀" if continuous_running else "⏹️"
+                status_text = "Active" if continuous_running else "Stopped"
+                total_scanned = stats['scanned']
+                
+                return f"""**Quick Stats:**
 - 🎯 Status: {status_emoji} {status_text}
 - 📋 URLs Pending: {stats['pending']}
 - 🔍 Total Scanned: {total_scanned}
 - 📧 Total Emails: {emails}
 - ⚡ Recent Activity: {recent_activity}/hour
 - 📊 Success Rate: {(emails/max(total_scanned,1)*100):.1f}%"""
+            except Exception as e:
+                print(f"Error getting auto stats: {e}")
+                return f"**Quick Stats:** Error loading stats - {str(e)}"
         
         # Connect auto repeat crawler events
         auto_start_btn.click(
@@ -2870,16 +2789,20 @@ When enabled, the scanner will automatically change VPN countries every 10-15 se
         # Auto-refresh functionality for live output
         def refresh_auto_output():
             """Refresh the auto crawler output and stats"""
-            stats = get_auto_stats()
-            output = get_auto_output()
-            if continuous_running:
-                status = "**Status:** 🚀 Running"
-            else:
-                status = "**Status:** ⏹️ Stopped"
-            return status, output, stats
+            try:
+                stats = get_auto_stats()
+                output = get_auto_output()
+                if continuous_running:
+                    status = "**Status:** 🚀 Running"
+                else:
+                    status = "**Status:** ⏹️ Stopped"
+                return status, output, stats
+            except Exception as e:
+                print(f"Error in auto-refresh: {e}")
+                return "**Status:** ❌ Error", f"Auto-refresh error: {str(e)}", "**Quick Stats:** Error loading stats"
         
         # Simple auto-refresh timer - only runs when checkbox is enabled
-        auto_refresh_timer = gr.Timer(value=3.0, active=False)  # 3 second refresh, start inactive
+        auto_refresh_timer = gr.Timer(value=5.0, active=True)  # 5 second refresh for stability, start active
         auto_refresh_timer.tick(
             refresh_auto_output,
             outputs=[auto_status, auto_live_output, auto_stats]
@@ -2888,12 +2811,19 @@ When enabled, the scanner will automatically change VPN countries every 10-15 se
         # Control auto-refresh based on checkbox
         def toggle_auto_refresh(enabled):
             """Toggle the auto-refresh timer on/off"""
-            return gr.Timer(active=enabled)
+            print(f"Auto-refresh toggled: {enabled}")  # Debug logging
+            return gr.Timer(active=enabled, value=5.0)  # Reset timer when toggling
         
         auto_refresh.change(
             toggle_auto_refresh,
             inputs=[auto_refresh],
             outputs=[auto_refresh_timer]
+        )
+        
+        # Manual refresh button event handler
+        manual_refresh_btn.click(
+            refresh_auto_output,
+            outputs=[auto_status, auto_live_output, auto_stats]
         )
         
         # VPN Event Handlers
@@ -3105,7 +3035,6 @@ nordvpn set autoconnect off
 
         # Initialize components (must be inside Blocks context)
         demo.load(refresh_results, outputs=[results_table, email_count])
-        demo.load(get_statistics, outputs=[stats_display, recent_activity])
         demo.load(refresh_vpn_status, outputs=[auth_status, vpn_status, current_ip, vpn_console, install_status])
         demo.load(_refresh_verbose, outputs=[verbose_textbox])
     
