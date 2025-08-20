@@ -1984,6 +1984,8 @@ async def ultra_fast_processing(progress_callback=None, batch_size=50, verbose_m
         batch_data = []
         
         for url_id, url, location, category in batch:
+            if super_verbose_mode:
+                log(f"� Scanning: {url}", verbose_only=True)
             task = extract_emails_from_post(url, "Ultra Fast Scan")
             batch_tasks.append(task)
             batch_data.append((url_id, url, location, category))
@@ -2009,6 +2011,10 @@ async def ultra_fast_processing(progress_callback=None, batch_size=50, verbose_m
                     found_email = 0
                     
                     if email_data and email_data.get('email'):
+                        # Show found email in verbose mode
+                        if super_verbose_mode:
+                            log(f"✅ Email: {email_data['email']} from {url[:50]}...", verbose_only=True)
+                        
                         # Quick database save
                         db_tuple = (
                             email_data['first_name'], email_data['last_name'], email_data['title'],
@@ -2020,6 +2026,9 @@ async def ultra_fast_processing(progress_callback=None, batch_size=50, verbose_m
                         save_email_to_db(db_tuple)
                         found_email = 1
                         batch_emails += 1
+                    else:
+                        if super_verbose_mode:
+                            log(f"⚪ No email found at {url[:50]}...", verbose_only=True)
                         log(f"📧 Found: {email_data['email']} @ {email_data['company_name']}", verbose_only=True)
                     else:
                         log(f"⚪ No email: {url[:40]}...", verbose_only=True)
