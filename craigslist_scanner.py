@@ -24,6 +24,7 @@ import builtins
 
 # Configuration
 DB_PATH = "craigslist_emails.db"
+OPTIMIZATION_DB = "crawler_optimization.db"
 EMAIL_RE = re.compile(r"[a-zA-Z0-9_.+\-]+@[a-zA-Z0-9\-]+\.[a-zA-Z0-9\-.]+")
 PHONE_RE = re.compile(r"(?:\+?\d[\s.-]?)?(?:\(\d{3}\)|\d{3})[\s.-]?\d{3}[\s.-]?\d{4}")
 
@@ -603,6 +604,148 @@ def cleanup_old_scanned_urls(days=7):
     except Exception as e:
         print(f"Error cleaning up old URLs: {e}")
         return 0
+
+def init_optimization_database():
+    """Initialize the crawler optimization database for performance metrics"""
+    try:
+        conn = sqlite3.connect(OPTIMIZATION_DB)
+        cursor = conn.cursor()
+        
+        # Performance metrics table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS performance_metrics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                urls_per_second REAL,
+                batch_size INTEGER,
+                concurrent_threads INTEGER,
+                emails_found INTEGER,
+                cycle_time REAL,
+                success_rate REAL,
+                memory_usage REAL
+            )
+        ''')
+        
+        # Current optimization settings
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS optimization_settings (
+                id INTEGER PRIMARY KEY,
+                auto_optimize BOOLEAN DEFAULT 1,
+                target_urls_per_second REAL DEFAULT 15.0,
+                max_batch_size INTEGER DEFAULT 100,
+                max_threads INTEGER DEFAULT 50,
+                min_batch_size INTEGER DEFAULT 10,
+                min_threads INTEGER DEFAULT 5,
+                optimization_interval INTEGER DEFAULT 10
+            )
+        ''')
+        
+        # Insert default settings if not exists
+        cursor.execute('''
+            INSERT OR IGNORE INTO optimization_settings (id, auto_optimize, target_urls_per_second, max_batch_size, max_threads)
+            VALUES (1, 1, 15.0, 100, 50)
+        ''')
+        
+        conn.commit()
+        conn.close()
+        print("🎯 Optimization database initialized")
+        
+    except Exception as e:
+        print(f"Warning: Could not initialize optimization database: {e}")
+
+def get_optimization_settings():
+    """Get current optimization settings"""
+    try:
+        conn = sqlite3.connect(OPTIMIZATION_DB)
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM optimization_settings WHERE id = 1')
+        result = cursor.fetchone()
+        conn.close()
+        
+        if result:
+            return {
+                'auto_optimize': bool(result[1]),
+                'target_urls_per_second': result[2],
+                'max_batch_size': result[3],
+                'max_threads': result[4],
+                'min_batch_size': result[5],
+                'min_threads': result[6],
+                'optimization_interval': result[7]
+            }
+        else:
+            return {
+                'auto_optimize': True,
+                'target_urls_per_second': 15.0,
+                'max_batch_size': 100,
+                'max_threads': 50,
+                'min_batch_size': 10,
+                'min_threads': 5,
+                'optimization_interval': 10
+            }
+    except Exception as e:
+        print(f"Error getting optimization settings: {e}")
+        return {'auto_optimize': False}
+
+def save_performance_metrics(urls_per_second, batch_size, threads, emails_found, cycle_time, success_rate):
+    """Save performance metrics to optimization database"""
+    try:
+        conn = sqlite3.connect(OPTIMIZATION_DB)
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO performance_metrics 
+            (urls_per_second, batch_size, concurrent_threads, emails_found, cycle_time, success_rate)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (urls_per_second, batch_size, threads, emails_found, cycle_time, success_rate))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"Error saving performance metrics: {e}")
+
+def optimize_crawler_settings():
+    """Auto-optimize crawler settings based on recent performance"""
+    try:
+        conn = sqlite3.connect(OPTIMIZATION_DB)
+        cursor = conn.cursor()
+        
+        # Get last 10 performance records
+        cursor.execute('''
+            SELECT urls_per_second, batch_size, concurrent_threads, success_rate, cycle_time
+            FROM performance_metrics 
+            ORDER BY timestamp DESC LIMIT 10
+        ''')
+        recent_metrics = cursor.fetchall()
+        
+        # Get current settings
+        settings = get_optimization_settings()
+        
+        if len(recent_metrics) >= 3:  # Need some data to optimize
+            avg_speed = sum(row[0] for row in recent_metrics) / len(recent_metrics)
+            avg_success_rate = sum(row[3] for row in recent_metrics) / len(recent_metrics)
+            target_speed = settings['target_urls_per_second']
+            
+            # Optimization logic
+            if avg_speed < target_speed * 0.8 and avg_success_rate > 0.8:
+                # Too slow but successful - increase batch size
+                new_batch = min(settings['max_batch_size'], int(recent_metrics[0][1] * 1.2))
+                new_threads = min(settings['max_threads'], int(recent_metrics[0][2] * 1.1))
+            elif avg_success_rate < 0.7:
+                # Low success rate - reduce load
+                new_batch = max(settings['min_batch_size'], int(recent_metrics[0][1] * 0.8))
+                new_threads = max(settings['min_threads'], int(recent_metrics[0][2] * 0.9))
+            else:
+                # Performing well - slight increase
+                new_batch = min(settings['max_batch_size'], recent_metrics[0][1] + 5)
+                new_threads = min(settings['max_threads'], recent_metrics[0][2] + 2)
+            
+            conn.close()
+            return new_batch, new_threads
+        
+        conn.close()
+        return 50, 20  # Default values
+        
+    except Exception as e:
+        print(f"Error optimizing settings: {e}")
+        return 50, 20
 
 def parse_contact_name(raw_name):
     """Parse raw name into first_name, last_name, and company_name"""
@@ -1817,7 +1960,7 @@ async def discover_limited_urls(progress_callback=None, max_locations=10, max_ca
     log(f"✅ Limited discovery complete! Found {total_discovered} new URLs")
     return total_discovered
 
-async def optimized_auto_repeat_crawl(progress_callback=None, urls_per_cycle=50, max_cycles=20, verbose_mode=False):
+async def optimized_auto_repeat_crawl(progress_callback=None, auto_optimize=True, verbose_mode=False):
     """OPTIMIZED Auto-Repeat Crawl: Maximum speed, maximum efficiency, live output"""
     
     global super_verbose_mode
@@ -1830,29 +1973,29 @@ async def optimized_auto_repeat_crawl(progress_callback=None, urls_per_cycle=50,
     
     log("� OPTIMIZED AUTO-REPEAT CRAWLER STARTING...")
     log("⚡ Configuration: ULTRA FAST mode with concurrent processing")
-    log(f"🎯 Target: {urls_per_cycle} URLs per cycle, {max_cycles} max cycles")
+    log(f"🎯 Target: Continuous crawling until stopped")
     log("=" * 60)
     
+    # Initialize performance tracking
+    cycle_count = 0
     total_discovered = 0
     total_processed = 0
     total_emails = 0
     start_time = datetime.now()
     
-    # Optimal settings for maximum speed
-    max_locations = 15  # Good coverage
-    max_categories = 12  # Most active categories
-    batch_size = 50     # Large batches for efficiency
+    # Get initial optimization settings
+    settings = get_optimization_settings()
+    batch_size = 50
+    max_threads = 20
     
-    log(f"🌍 Scanning {max_locations} locations x {max_categories} categories")
-    log(f"⚡ Batch processing: {batch_size} URLs at once")
+    log(f"� Auto-optimization: {'ENABLED' if settings['auto_optimize'] else 'DISABLED'}")
+    log(f"📊 Initial settings: Batch={batch_size}, Threads={max_threads}")
+    log(f"🌍 Scanning all locations and categories")
     
-    for cycle in range(1, max_cycles + 1):
-        if not continuous_running:
-            log("🛑 STOPPED by user")
-            break
-            
+    while continuous_running:
+        cycle_count += 1
         cycle_start = datetime.now()
-        log(f"\n🔄 ===== CYCLE {cycle}/{max_cycles} =====")
+        log(f"\n🔄 ===== CYCLE {cycle_count} (CONTINUOUS) =====")
         
         # PHASE 1: Check for existing pending URLs first, then discover if needed
         queue_stats = get_queue_stats()
@@ -1860,20 +2003,21 @@ async def optimized_auto_repeat_crawl(progress_callback=None, urls_per_cycle=50,
         if super_verbose_mode:
             log(f"📊 Pre-cycle queue: {queue_stats['pending']} pending, {queue_stats['scanned']} scanned")
         
-        if queue_stats['pending'] >= urls_per_cycle:
+        if queue_stats['pending'] >= batch_size:
             log(f"📋 Phase 1: Processing existing {queue_stats['pending']} pending URLs (skipping discovery)")
             discovered = 0  # No need to discover, we have plenty pending
             
             if super_verbose_mode:
                 log(f"💡 Strategy: Using existing pending URLs - no discovery needed this cycle")
         else:
-            log(f"📋 Phase 1: Lightning-fast URL discovery (target: {urls_per_cycle})")
-            discovered = await ultra_fast_discovery(progress_callback, max_locations, max_categories, urls_per_cycle, verbose_mode)
+            target_urls = max(batch_size, 50)  # Always try to get at least 50 URLs
+            log(f"📋 Phase 1: Lightning-fast URL discovery (target: {target_urls})")
+            discovered = await ultra_fast_discovery(progress_callback, 15, 12, target_urls, verbose_mode)
             total_discovered += discovered
         
-        if discovered == 0 and queue_stats['pending'] < urls_per_cycle:
+        if discovered == 0 and queue_stats['pending'] == 0:
             # Only stop if we discovered nothing AND don't have pending URLs to process
-            log(f"⚠️ No new URLs found in cycle {cycle}")
+            log(f"⚠️ No URLs available in cycle {cycle_count}")
             log("💡 This might mean we've found all available posts")
             if cycle > 3:  # Only break after a few cycles
                 log("🏁 Ending crawl - no more URLs available")
@@ -1903,10 +2047,13 @@ async def optimized_auto_repeat_crawl(progress_callback=None, urls_per_cycle=50,
         log(f"📈 TOTALS: {total_discovered} URLs found, {total_processed} processed, {total_emails} emails")
         log(f"⚡ Speed: {rate:.1f} URLs/second average")
         
-        # Brief pause between cycles (minimal for speed)
-        if cycle < max_cycles and continuous_running and discovered > 0:
-            log("⏸️ Quick pause before next cycle...")
-            await asyncio.sleep(1)  # Very brief pause
+        # Brief pause between cycles for system stability
+        if processed > 0:
+            log("⏸️ Quick pause (optimization interval)...")
+            await asyncio.sleep(2)  # Very brief pause
+        else:
+            log("⏸️ No URLs processed - longer pause...")
+            await asyncio.sleep(10)  # Longer pause if nothing to do
     
     # Final summary
     total_time = (datetime.now() - start_time).total_seconds()
@@ -2118,6 +2265,7 @@ def stop_continuous_scan():
 # Gradio Interface
 def create_interface():
     init_database()
+    init_optimization_database()
     init_url_tracking_db()  # Initialize URL tracking
     
     custom_css = """
@@ -2151,26 +2299,15 @@ def create_interface():
                 
                 with gr.Row():
                     with gr.Column(scale=1):
-                        gr.Markdown("#### 🎯 Quick Settings")
+                        gr.Markdown("#### 🎯 Continuous Crawler Settings")
                         
-                        # Simplified settings - preset for optimal performance
-                        with gr.Row():
-                            auto_urls_per_cycle = gr.Slider(
-                                25, 100, value=50, step=25,
-                                label="🎯 URLs per Cycle",
-                                info="More URLs = faster but more resource intensive"
-                            )
-                            
-                            auto_max_cycles = gr.Slider(
-                                5, 50, value=20, step=5,
-                                label="🔄 Max Cycles",
-                                info="How many discover→scan cycles to run"
-                            )
+                        # Info about continuous mode
+                        gr.Markdown("**🚀 Infinite Mode:** Crawler runs continuously until manually stopped.<br/>**🤖 Auto-Optimization:** Settings automatically adjust for best performance.")
                         
                         # Big start/stop buttons
                         with gr.Row():
                             auto_start_btn = gr.Button(
-                                "🚀 START AUTO REPEAT CRAWL", 
+                                "🚀 START CONTINUOUS CRAWL", 
                                 variant="primary", 
                                 size="lg",
                                 elem_classes=["big-button"]
@@ -2629,8 +2766,8 @@ When enabled, the scanner will automatically change VPN countries every 10-15 se
             return stats_text
         
         # Auto Repeat Crawler Event Handlers
-        def start_auto_repeat_crawler(urls_per_cycle, max_cycles, verbose_mode):
-            """Start the optimized auto repeat crawler"""
+        def start_auto_repeat_crawler(verbose_mode):
+            """Start the optimized continuous auto repeat crawler"""
             global continuous_running, continuous_thread
             
             if continuous_running:
@@ -2642,9 +2779,9 @@ When enabled, the scanner will automatically change VPN countries every 10-15 se
             clear_auto_output()
             
             # Initial messages
-            manage_auto_output("🚀 OPTIMIZED AUTO-REPEAT CRAWLER STARTING...")
-            manage_auto_output(f"⚡ ULTRA FAST MODE: Maximum concurrency enabled")
-            manage_auto_output(f"🎯 Configuration: {urls_per_cycle} URLs per cycle, {max_cycles} max cycles")
+            manage_auto_output("🚀 CONTINUOUS AUTO-REPEAT CRAWLER STARTING...")
+            manage_auto_output(f"⚡ INFINITE MODE: Self-optimizing performance enabled")
+            manage_auto_output(f"🎯 Configuration: Continuous crawling until stopped")
             if verbose_mode:
                 manage_auto_output("🔍 SUPER VERBOSE MODE ENABLED - Detailed technical output")
             manage_auto_output("=" * 60)
@@ -2658,7 +2795,7 @@ When enabled, the scanner will automatically change VPN countries every 10-15 se
                 asyncio.set_event_loop(loop)
                 try:
                     loop.run_until_complete(
-                        optimized_auto_repeat_crawl(update_auto_output, urls_per_cycle, max_cycles, verbose_mode)
+                        optimized_auto_repeat_crawl(update_auto_output, auto_optimize=True, verbose_mode=verbose_mode)
                     )
                 except Exception as e:
                     update_auto_output(f"❌ Crawler error: {str(e)}")
@@ -2721,7 +2858,7 @@ When enabled, the scanner will automatically change VPN countries every 10-15 se
         # Connect auto repeat crawler events
         auto_start_btn.click(
             start_auto_repeat_crawler,
-            inputs=[auto_urls_per_cycle, auto_max_cycles, super_verbose],
+            inputs=[super_verbose],
             outputs=[auto_status, auto_live_output, auto_stats]
         )
         
