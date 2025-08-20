@@ -1232,7 +1232,7 @@ async def rotate_vpn_if_needed(force_rotate=False, is_network_error=False):
         consecutive_network_errors = max(0, consecutive_network_errors - 1)
     
     # Only rotate for actual network blocks, not HTTP status codes
-    should_rotate = force_rotate or consecutive_network_errors >= 3  # Reduced from 5 to 3 for more aggressive rotation
+    should_rotate = force_rotate or consecutive_network_errors >= 8  # Increased from 3 to 8 to be less aggressive
     
     if not should_rotate:
         return True, last_ip_check or vpn_manager.get_current_ip()
@@ -1957,6 +1957,10 @@ async def discover_craigslist_urls(location, category, progress_callback=None):
                 # Move to next page
                 page += 1
                 
+                # Add delay between page requests to be respectful to Craigslist
+                if page < max_pages:  # Don't delay after the last page
+                    await asyncio.sleep(2.0)  # 2 second delay between pages
+                
             # End of pagination loop
             log(f"🎯 Total URLs discovered: {len(discovered_urls)} from {page} pages")
         
@@ -2016,19 +2020,19 @@ async def comprehensive_craigslist_crawl(progress_callback=None, max_locations=1
                 conn.close()
                 
                 # ULTRA FAST - minimal rate limiting between categories
-                await asyncio.sleep(0.1)  # Reduced from 0.5 to 0.1 seconds
+                await asyncio.sleep(1.0)  # Increased from 0.1 to 1.0 seconds to be more respectful
                 
             except Exception as e:
                 log(f"❌ Error crawling {location}/{category}: {str(e)}")
                 continue
         
         # Rate limiting between locations to avoid overwhelming servers
-        await asyncio.sleep(1.0)  # Increased from 0.2 to 1.0 seconds
+        await asyncio.sleep(3.0)  # Increased from 1.0 to 3.0 seconds for better rate limiting
     
     log(f"🎉 Crawl complete! Discovered {total_discovered} new URLs")
     return total_discovered
 
-async def process_url_queue(progress_callback=None, batch_size=5, max_cycles=10):
+async def process_url_queue(progress_callback=None, batch_size=3, max_cycles=10):
     """Process URLs from the queue systematically with multiple processing cycles"""
     
     def log(msg):
@@ -2382,7 +2386,7 @@ async def comprehensive_discovery(progress_callback=None, target_urls=500000):
         
         # Process categories for this location
         site_discovered = 0
-        batch_size = 5
+        batch_size = 2  # Much smaller batch size to be gentler
         
         for i in range(0, len(categories), batch_size):
             batch_categories = categories[i:i + batch_size]
@@ -2428,8 +2432,9 @@ async def comprehensive_discovery(progress_callback=None, target_urls=500000):
             if site_discovered >= target_per_site:
                 break
                 
-            # Brief pause between batches
-            await asyncio.sleep(0.5)
+            # Longer pause between batches to be respectful
+            log(f"⏳ Pausing 3 seconds between batches...")
+            await asyncio.sleep(3.0)
         
         sites_processed += 1
         log(f"🏁 {location} complete: {site_discovered} URLs discovered ({sites_processed} sites processed)")
@@ -2439,8 +2444,9 @@ async def comprehensive_discovery(progress_callback=None, target_urls=500000):
             log(f"🎯 Overall target reached: {total_discovered} URLs across {sites_processed} sites")
             return total_discovered
         
-        # Brief pause between sites
-        await asyncio.sleep(1.0)
+        # Longer pause between sites to be respectful
+        log(f"⏳ Pausing 10 seconds before next site...")
+        await asyncio.sleep(10.0)
     
     log(f"🏁 Comprehensive discovery complete: {total_discovered} URLs from {sites_processed} sites")
     return total_discovered
