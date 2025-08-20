@@ -647,6 +647,128 @@ def extract_names_from_content(text_content, post_title=""):
     
     return names_found, companies_found
 
+def extract_company_from_email(email):
+    """Extract company name from email domain"""
+    if not email or "@" not in email:
+        return ""
+    
+    domain = email.split("@")[1].lower()
+    
+    # Skip common free email providers
+    free_providers = [
+        "gmail.com", "yahoo.com", "hotmail.com", "outlook.com", "aol.com",
+        "icloud.com", "me.com", "live.com", "msn.com", "comcast.net",
+        "verizon.net", "att.net", "charter.net", "cox.net"
+    ]
+    
+    if domain in free_providers:
+        return ""
+    
+    # Extract company name from domain
+    # Remove common TLDs and subdomains
+    domain_parts = domain.replace(".com", "").replace(".net", "").replace(".org", "")
+    domain_parts = domain_parts.replace(".co", "").replace(".us", "").replace(".biz", "")
+    domain_parts = domain_parts.replace("www.", "").replace("mail.", "")
+    
+    # Split by dots and take the main part
+    main_part = domain_parts.split(".")[0]
+    
+    # Clean up and format
+    if len(main_part) >= 3:
+        # Convert to proper case and add common business suffix if missing
+        company = main_part.replace("-", " ").replace("_", " ").title()
+        
+        # Add "Services" if it's a single word without business indicators
+        if " " not in company and not any(suffix in company.lower() for suffix in ["llc", "inc", "corp", "co"]):
+            company += " Services"
+        
+        return company
+    
+    return ""
+
+def fix_company_names():
+    """Scan and fix company names for emails with blank or 'QR' company names"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        
+        # Find emails with blank company_name or containing "QR"
+        cursor.execute('''
+            SELECT id, email, first_name, last_name, company_name, raw_name, raw_post_title
+            FROM emails 
+            WHERE company_name IS NULL 
+               OR company_name = '' 
+               OR company_name LIKE '%QR%'
+               OR company_name LIKE '%qr%'
+        ''')
+        
+        records = cursor.fetchall()
+        fixed_count = 0
+        
+        for record_id, email, first_name, last_name, old_company, raw_name, raw_post_title in records:
+            new_company = ""
+            
+            # Try to extract from email domain first
+            if email:
+                new_company = extract_company_from_email(email)
+            
+            # If no company from email, try to re-parse raw_name with enhanced logic
+            if not new_company and raw_name:
+                # Enhanced company detection
+                enhanced_keywords = [
+                    "llc", "inc", "co", "company", "corp", "ltd", "agency", "studio", 
+                    "group", "services", "solutions", "enterprises", "consulting", "design",
+                    "photography", "construction", "cleaning", "landscaping", "catering",
+                    "automotive", "repair", "maintenance", "technologies", "tech", "systems",
+                    "contractors", "professional", "specialists", "experts", "associates"
+                ]
+                
+                raw_lower = raw_name.lower()
+                if any(keyword in raw_lower for keyword in enhanced_keywords):
+                    new_company = raw_name.strip()
+                elif "& " in raw_name or " and " in raw_name.lower():
+                    new_company = raw_name.strip()
+            
+            # If still no company, try post title
+            if not new_company and raw_post_title:
+                title_lower = raw_post_title.lower()
+                if any(keyword in title_lower for keyword in ["services", "company", "llc", "inc", "business"]):
+                    # Extract potential company from title
+                    title_parts = raw_post_title.split(" - ")
+                    if title_parts:
+                        potential = title_parts[0].strip()
+                        if 5 <= len(potential) <= 50:
+                            new_company = potential
+            
+            # If we found a better company name, update it
+            if new_company and new_company != old_company:
+                cursor.execute('''
+                    UPDATE emails 
+                    SET company_name = ?, first_name = '', last_name = ''
+                    WHERE id = ?
+                ''', (new_company, record_id))
+                fixed_count += 1
+            
+            # If still no company but we have first/last name, keep as individual
+            elif not new_company and (first_name or last_name):
+                # Just clear the bad company name
+                if old_company and ("QR" in old_company or "qr" in old_company):
+                    cursor.execute('''
+                        UPDATE emails 
+                        SET company_name = ''
+                        WHERE id = ?
+                    ''', (record_id,))
+                    fixed_count += 1
+        
+        conn.commit()
+        conn.close()
+        
+        return fixed_count, len(records)
+        
+    except Exception as e:
+        print(f"Error fixing company names: {e}")
+        return 0, 0
+
 def parse_email_for_name(email):
     """Extract potential name from email local part as fallback"""
     if not email or "@" not in email:
@@ -1794,6 +1916,7 @@ def create_interface():
                 with gr.Row():
                     refresh_btn = gr.Button("🔄 Refresh Results")
                     clear_btn = gr.Button("🗑️ Clear All", variant="secondary")
+                    fix_companies_btn = gr.Button("🏢 Fix Company Names", variant="primary")
                     export_csv = gr.Button("📄 Export CSV")
                     download_file = gr.File(label="Download", interactive=False)
             
@@ -1900,6 +2023,9 @@ When enabled, the scanner will automatically change VPN countries every 10-15 se
                     show_copy_button=True
                 )
         
+        # Status message for company fixing
+        fix_status = gr.Markdown("")
+        
         # Event handlers
         def _refresh_verbose():
             return get_verbose_text()
@@ -1958,6 +2084,26 @@ When enabled, the scanner will automatically change VPN countries every 10-15 se
             except Exception:
                 return results_table.value, email_count.value
         
+        def fix_company_names_ui():
+            """UI function to fix company names"""
+            try:
+                fixed_count, total_checked = fix_company_names()
+                
+                if fixed_count > 0:
+                    message = f"✅ Fixed {fixed_count} company names out of {total_checked} records checked"
+                    # Refresh the results table
+                    updated_data = load_emails_from_db()
+                    count = len(updated_data)
+                    count_html = f"<div style='text-align: right; font-size: 18px; font-weight: bold; color: #2563eb;'>📊 Total Emails: {count}</div>"
+                    return updated_data, count_html, message
+                else:
+                    message = f"ℹ️ No company names needed fixing. Checked {total_checked} records."
+                    return load_emails_from_db(), email_count.value, message
+                    
+            except Exception as e:
+                error_msg = f"❌ Error fixing company names: {str(e)}"
+                return load_emails_from_db(), email_count.value, error_msg
+
         def export_to_csv():
             """Export current results to a CSV matching the sample format."""
             try:
@@ -2115,6 +2261,7 @@ When enabled, the scanner will automatically change VPN countries every 10-15 se
         
         refresh_btn.click(refresh_results, outputs=[results_table, email_count])
         clear_btn.click(clear_all_results, outputs=[results_table, email_count])
+        fix_companies_btn.click(fix_company_names_ui, outputs=[results_table, email_count, fix_status])
         export_csv.click(export_to_csv, outputs=[download_file])
         refresh_stats_btn.click(get_statistics, outputs=[stats_display, recent_activity])
         
