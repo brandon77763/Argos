@@ -528,6 +528,19 @@ def init_database():
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_email ON emails(email)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_url ON emails(url)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_scanned_url ON scanned_urls(url)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_scanned_date ON scanned_urls(scan_date)')
+    
+    # Clean up old scanned URLs (older than 7 days) for performance
+    try:
+        cursor.execute('''
+            DELETE FROM scanned_urls 
+            WHERE scan_date < datetime('now', '-7 days')
+        ''')
+        deleted_count = cursor.rowcount
+        if deleted_count > 0:
+            print(f"🧹 Automatically cleaned up {deleted_count} old scanned URLs (>7 days) for better performance")
+    except Exception as e:
+        print(f"Warning: Could not clean old URLs: {e}")
     
     # Migrate existing data if needed
     try:
@@ -570,6 +583,26 @@ def init_database():
     
     conn.commit()
     conn.close()
+
+def cleanup_old_scanned_urls(days=7):
+    """Manually clean up scanned URLs older than specified days"""
+    try:
+        conn = sqlite3.connect(DATABASE)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            DELETE FROM scanned_urls 
+            WHERE scan_date < datetime('now', '-{} days')
+        '''.format(days))
+        
+        deleted_count = cursor.rowcount
+        conn.commit()
+        conn.close()
+        
+        return deleted_count
+    except Exception as e:
+        print(f"Error cleaning up old URLs: {e}")
+        return 0
 
 def parse_contact_name(raw_name):
     """Parse raw name into first_name, last_name, and company_name"""
@@ -1357,7 +1390,7 @@ async def scan_craigslist_for_emails(location, category, keywords, max_results, 
         return pd.DataFrame(columns=DEFAULT_COLUMNS)
 
 def is_url_in_database_batch(urls):
-    """Check multiple URLs at once for better performance"""
+    """Check multiple URLs at once for better performance - only checks recent scans (7 days)"""
     try:
         if not urls:
             return {}
@@ -1372,7 +1405,12 @@ def is_url_in_database_batch(urls):
         cursor.execute(f'SELECT url FROM url_queue WHERE url IN ({placeholders})', urls)
         queue_urls = {row[0] for row in cursor.fetchall()}
         
-        cursor.execute(f'SELECT url FROM scanned_urls WHERE url IN ({placeholders})', urls)
+        # Only check scanned URLs from the last 7 days for performance optimization
+        cursor.execute(f'''
+            SELECT url FROM scanned_urls 
+            WHERE url IN ({placeholders}) 
+            AND scan_date > datetime('now', '-7 days')
+        ''', urls)
         scanned_urls = {row[0] for row in cursor.fetchall()}
         
         conn.close()
@@ -1833,7 +1871,8 @@ async def optimized_auto_repeat_crawl(progress_callback=None, urls_per_cycle=50,
             discovered = await ultra_fast_discovery(progress_callback, max_locations, max_categories, urls_per_cycle, verbose_mode)
             total_discovered += discovered
         
-        if discovered == 0:
+        if discovered == 0 and queue_stats['pending'] < urls_per_cycle:
+            # Only stop if we discovered nothing AND don't have pending URLs to process
             log(f"⚠️ No new URLs found in cycle {cycle}")
             log("💡 This might mean we've found all available posts")
             if cycle > 3:  # Only break after a few cycles
@@ -2029,9 +2068,6 @@ async def ultra_fast_processing(progress_callback=None, batch_size=50, verbose_m
                     else:
                         if super_verbose_mode:
                             log(f"⚪ No email found at {url[:50]}...", verbose_only=True)
-                        log(f"📧 Found: {email_data['email']} @ {email_data['company_name']}", verbose_only=True)
-                    else:
-                        log(f"⚪ No email: {url[:40]}...", verbose_only=True)
                     
                     mark_url_scanned(url_id, found_email)
                     processed += 1
@@ -2210,7 +2246,11 @@ def create_interface():
                         interactive=False
                     )
                     
-                    refresh_stats_btn = gr.Button("🔄 Refresh Statistics")
+                    with gr.Row():
+                        refresh_stats_btn = gr.Button("🔄 Refresh Statistics")
+                        cleanup_btn = gr.Button("🧹 Clean Old URLs (>7 days)", variant="secondary")
+                    
+                    cleanup_status = gr.Markdown("")
             
             with gr.Tab("🔒 VPN Control"):
                 gr.Markdown("### NordVPN Integration\nManage VPN connections for anonymous scanning and rate limit avoidance.")
@@ -2472,6 +2512,22 @@ When enabled, the scanner will automatically change VPN countries every 10-15 se
         fix_companies_btn.click(fix_company_names_ui, outputs=[results_table, email_count, fix_status])
         export_csv.click(export_to_csv, outputs=[download_file])
         refresh_stats_btn.click(get_statistics, outputs=[stats_display, recent_activity])
+        
+        # Cleanup old URLs event handler
+        def cleanup_old_urls_ui():
+            try:
+                deleted_count = cleanup_old_scanned_urls(7)
+                status_msg = f"✅ Cleaned up {deleted_count} old URLs (>7 days) for better performance!"
+                # Refresh stats after cleanup
+                stats, activity = get_statistics()
+                return stats, activity, status_msg
+            except Exception as e:
+                return "Error occurred during cleanup", [], f"❌ Error: {str(e)}"
+        
+        cleanup_btn.click(
+            cleanup_old_urls_ui, 
+            outputs=[stats_display, recent_activity, cleanup_status]
+        )
         
         # Comprehensive Crawler Event Handlers
         crawler_console_output = ""
