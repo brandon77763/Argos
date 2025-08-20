@@ -195,24 +195,85 @@ def init_url_tracking_db():
     conn.close()
 
 def add_urls_to_queue(urls_data, location="", category=""):
-    """Add discovered URLs to scanning queue"""
+    """Add discovered URLs to scanning queue, allowing re-scan of old URLs"""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
     added_count = 0
     for url_data in urls_data:
         try:
+            url = url_data['url']
+            
+            # Super verbose logging
+            if super_verbose_mode:
+                print(f"🔍 SUPER VERBOSE: Processing URL for queue: {url}")
+            
+            # Check if URL exists and when it was last scanned
             cursor.execute('''
-                INSERT OR IGNORE INTO url_queue (url, location, category)
-                VALUES (?, ?, ?)
-            ''', (url_data['url'], location, category))
-            if cursor.rowcount > 0:
-                added_count += 1
-        except sqlite3.Error:
+                SELECT id, scanned_date FROM url_queue 
+                WHERE url = ?
+            ''', (url,))
+            existing = cursor.fetchone()
+            
+            if existing:
+                if super_verbose_mode:
+                    print(f"🔍 SUPER VERBOSE: URL exists in queue (ID: {existing[0]}, Last scan: {existing[1]})")
+                
+                # If URL exists, check if it's old enough to re-scan (older than 24 hours)
+                if existing[1]:  # Has been scanned before
+                    cursor.execute('''
+                        SELECT datetime('now', '-24 hours') > scanned_date
+                        FROM url_queue WHERE id = ?
+                    ''', (existing[0],))
+                    should_rescan = cursor.fetchone()[0]
+                    
+                    if should_rescan:
+                        if super_verbose_mode:
+                            print(f"🔍 SUPER VERBOSE: URL is old enough to re-scan - resetting to pending")
+                        # Reset status to pending for re-scan
+                        cursor.execute('''
+                            UPDATE url_queue 
+                            SET status = 'pending', error_count = 0, priority = 1
+                            WHERE id = ?
+                        ''', (existing[0],))
+                        if cursor.rowcount > 0:
+                            added_count += 1
+                    else:
+                        if super_verbose_mode:
+                            print(f"🔍 SUPER VERBOSE: URL too recent to re-scan (< 24 hours)")
+                else:
+                    if super_verbose_mode:
+                        print(f"🔍 SUPER VERBOSE: URL exists but never scanned - updating priority")
+                    # URL exists but never scanned, update priority
+                    cursor.execute('''
+                        UPDATE url_queue 
+                        SET status = 'pending', priority = 1
+                        WHERE id = ?
+                    ''', (existing[0],))
+                    if cursor.rowcount > 0:
+                        added_count += 1
+            else:
+                if super_verbose_mode:
+                    print(f"🔍 SUPER VERBOSE: NEW URL - adding to queue")
+                # New URL, insert it
+                cursor.execute('''
+                    INSERT INTO url_queue (url, location, category)
+                    VALUES (?, ?, ?)
+                ''', (url, location, category))
+                if cursor.rowcount > 0:
+                    added_count += 1
+                    
+        except sqlite3.Error as e:
+            if super_verbose_mode:
+                print(f"🔍 SUPER VERBOSE: Database error adding URL {url_data.get('url', 'unknown')}: {e}")
             continue
     
     conn.commit()
     conn.close()
+    
+    if super_verbose_mode:
+        print(f"🔍 SUPER VERBOSE: Queue operation complete - {added_count} URLs added/updated")
+    
     return added_count
 
 def get_next_urls_to_scan(limit=10):
@@ -1609,16 +1670,26 @@ async def discover_craigslist_urls(location, category, progress_callback=None):
         
         # Build category listing URL - this shows the list of posts, not individual posts
         if category in ["jjj", "acc", "ofc", "bus", "csr", "etc", "fbh", "gov", "hea", "hum", "eng", "edu"]:
-            # Jobs categories
-            listing_url = f"{base_url}/d/jobs/search/{category}"
+            # Jobs categories - try both old and new URL formats
+            listing_url = f"{base_url}/search/{category}"  # Simplified format
+            if progress_callback and super_verbose_mode:
+                log(f"🔍 SUPER VERBOSE: Using jobs URL format: {listing_url}")
         elif category in ["bbb", "aos", "aut", "bts", "biz", "cps", "crs", "evs", "fgs"]:
             # Services categories  
-            listing_url = f"{base_url}/d/services/search/{category}"
+            listing_url = f"{base_url}/search/{category}"  # Simplified format
+            if progress_callback and super_verbose_mode:
+                log(f"🔍 SUPER VERBOSE: Using services URL format: {listing_url}")
         else:
-            # General search
-            listing_url = f"{base_url}/d/for-sale/search/{category}"
+            # General for-sale search
+            listing_url = f"{base_url}/search/{category}"  # Simplified format
+            if progress_callback and super_verbose_mode:
+                log(f"🔍 SUPER VERBOSE: Using general URL format: {listing_url}")
         
         log(f"🔍 Discovering URLs from category listing: {listing_url}")
+        
+        # Super verbose mode logging
+        if progress_callback and super_verbose_mode:
+            log(f"🔍 SUPER VERBOSE: Attempting to fetch {listing_url}")
         
         # Parse the category listing page to extract post URLs
         async with httpx.AsyncClient(
@@ -1629,9 +1700,63 @@ async def discover_craigslist_urls(location, category, progress_callback=None):
             follow_redirects=True
         ) as client:
             
+            # First try the current URL format
             response = await client.get(listing_url)
             
+            if progress_callback and super_verbose_mode:
+                log(f"🔍 SUPER VERBOSE: HTTP {response.status_code} for {listing_url}")
+                log(f"🔍 SUPER VERBOSE: Response length: {len(response.text)} characters")
+                log(f"🔍 SUPER VERBOSE: First 500 chars: {response.text[:500]}")
+                
+            # If we get a 404 or redirect, try alternative URL formats
+            if response.status_code == 404 or 'craigslist' not in response.text.lower():
+                if progress_callback and super_verbose_mode:
+                    log(f"🔍 SUPER VERBOSE: Primary URL failed, trying alternative formats...")
+                
+                # Try different URL formats
+                alt_urls = [
+                    f"{base_url}/d/jobs/{category}",  # Jobs direct
+                    f"{base_url}/d/gigs/{category}",  # Gigs
+                    f"{base_url}/d/for-sale/{category}",  # For sale  
+                    f"{base_url}/d/services/{category}",  # Services
+                    f"{base_url}/{category}",  # Simple format
+                ]
+                
+                for alt_url in alt_urls:
+                    try:
+                        if progress_callback and super_verbose_mode:
+                            log(f"🔍 SUPER VERBOSE: Trying alternative URL: {alt_url}")
+                        
+                        alt_response = await client.get(alt_url)
+                        if alt_response.status_code == 200 and 'craigslist' in alt_response.text.lower():
+                            response = alt_response
+                            listing_url = alt_url
+                            if progress_callback and super_verbose_mode:
+                                log(f"🔍 SUPER VERBOSE: Alternative URL worked: {alt_url}")
+                            break
+                    except Exception as e:
+                        if progress_callback and super_verbose_mode:
+                            log(f"🔍 SUPER VERBOSE: Alternative URL {alt_url} failed: {e}")
+                        continue
+            
+            # Check if page is valid Craigslist listing page
+            if progress_callback and super_verbose_mode:
+                log(f"🔍 SUPER VERBOSE: Looking for Craigslist elements...")
+                log(f"🔍 SUPER VERBOSE: Page title: {soup.title.string if soup.title else 'No title'}")
+                log(f"🔍 SUPER VERBOSE: Has 'craigslist' in text: {'craigslist' in response.text.lower()}")
+                
+                # Check for common Craigslist elements
+                has_header = soup.find('header', class_='cl-header')
+                has_search = soup.find('form', class_='cl-search-form')
+                has_results = soup.find('div', class_='cl-results-page')
+                
+                log(f"🔍 SUPER VERBOSE: Has CL header: {bool(has_header)}")
+                log(f"🔍 SUPER VERBOSE: Has search form: {bool(has_search)}")
+                log(f"🔍 SUPER VERBOSE: Has results page: {bool(has_results)}")
+            
             if response.status_code != 200:
+                if progress_callback and super_verbose_mode:
+                    log(f"🔍 SUPER VERBOSE: Failed to fetch listing page: HTTP {response.status_code}")
                 log(f"❌ Failed to fetch listing page: HTTP {response.status_code}")
                 return []
             
@@ -1647,7 +1772,27 @@ async def discover_craigslist_urls(location, category, progress_callback=None):
                 all_links = soup.find_all('a', href=True)
                 post_links = [link for link in all_links if '/d/' in link['href'] and any(char.isdigit() for char in link['href'])]
             
-            log(f"� Found {len(post_links)} posts in category listing")
+            log(f"📄 Found {len(post_links)} posts in category listing")
+            
+            if progress_callback and super_verbose_mode:
+                log(f"🔍 SUPER VERBOSE: Found {len(post_links)} potential post links on {listing_url}")
+                # Show some sample link structures to debug
+                all_links = soup.find_all('a', href=True)[:10]  # First 10 links
+                log(f"🔍 SUPER VERBOSE: Sample links found on page:")
+                for i, link in enumerate(all_links):
+                    href = link.get('href', '')[:100]  # Truncate long URLs
+                    class_name = link.get('class', [])
+                    log(f"🔍 SUPER VERBOSE:   Link {i+1}: href='{href}' class='{class_name}'")
+                
+                # Check if page has the expected structure
+                if "craigslist" in response.text.lower():
+                    log(f"🔍 SUPER VERBOSE: Page contains 'craigslist' text - appears to be a real CL page")
+                else:
+                    log(f"🔍 SUPER VERBOSE: WARNING: Page doesn't contain 'craigslist' text - might be blocked/error page")
+                
+                # Check for specific error indicators
+                if "blocked" in response.text.lower() or "bot" in response.text.lower():
+                    log(f"🔍 SUPER VERBOSE: WARNING: Page content suggests we might be blocked")
             
             for link in post_links:
                 try:
@@ -1676,9 +1821,16 @@ async def discover_craigslist_urls(location, category, progress_callback=None):
                                 'category': category
                             })
                             
+                            if progress_callback and super_verbose_mode:
+                                log(f"🔍 SUPER VERBOSE: NEW URL FOUND: {full_url}")
+                                log(f"🔍 SUPER VERBOSE: Title: {title[:80]}...")
+                            
                             # Log every 50 discoveries
                             if len(discovered_urls) % 50 == 0:
                                 log(f"📊 Discovered {len(discovered_urls)} new URLs so far...")
+                        else:
+                            if progress_callback and super_verbose_mode:
+                                log(f"🔍 SUPER VERBOSE: DUPLICATE URL (already in DB): {full_url}")
                         
                 except Exception as e:
                     continue
@@ -2038,14 +2190,24 @@ async def optimized_auto_repeat_crawl(progress_callback=None, auto_optimize=True
             total_discovered += discovered
         
         if discovered == 0 and queue_stats['pending'] == 0:
-            # Only stop if we discovered nothing AND don't have pending URLs to process
+            # Be more persistent - Craigslist always has new posts
             log(f"⚠️ No URLs available in cycle {cycle_count}")
-            log("💡 This might mean we've found all available posts")
-            if cycle_count > 3:  # Only break after a few cycles
-                log("🏁 Ending crawl - no more URLs available")
-                break
+            log("💡 This might be temporary - new posts appear constantly on Craigslist")
+            if cycle_count > 10:  # Much more persistent - only stop after 10+ cycles
+                log("🔄 Taking a longer break before trying comprehensive discovery...")
+                # Try comprehensive discovery as a last resort
+                log("📋 Attempting comprehensive discovery across all locations/categories...")
+                discovered = await comprehensive_craigslist_crawl(progress_callback, 20, 15)
+                total_discovered += discovered
+                
+                if discovered == 0:
+                    log("🏁 No URLs found even with comprehensive search - pausing briefly")
+                    await asyncio.sleep(30)  # Wait 30 seconds before next cycle
+                else:
+                    log(f"✅ Comprehensive discovery found {discovered} new URLs!")
             else:
-                log("� Continuing to next cycle anyway...")
+                log("🔄 Continuing to next cycle - will try again shortly...")
+                await asyncio.sleep(10)  # Brief pause before retrying
                 continue
         
         log(f"✅ Discovery complete: {discovered} new URLs found")
@@ -2077,27 +2239,33 @@ async def optimized_auto_repeat_crawl(progress_callback=None, auto_optimize=True
             log("⏸️ No URLs processed - longer pause...")
             await asyncio.sleep(10)  # Longer pause if nothing to do
     
-    # Final summary
-    total_time = (datetime.now() - start_time).total_seconds()
-    rate = total_processed / total_time if total_time > 0 else 0
-    
-    log("\n" + "=" * 60)
-    log("🏁 AUTO-REPEAT CRAWL COMPLETE!")
-    log(f"📊 FINAL RESULTS:")
-    log(f"   🎯 Cycles completed: {cycle_count}")
-    log(f"   📋 URLs discovered: {total_discovered}")
-    log(f"   ⚡ URLs processed: {total_processed}")
-    log(f"   📧 Emails found: {total_emails}")
-    log(f"   ⏱️ Total time: {total_time:.1f} seconds")
-    log(f"   🚀 Average speed: {rate:.2f} URLs/second")
-    
-    # Final queue stats
-    stats = get_queue_stats()
-    log(f"📈 Queue status: {stats['pending']} pending, {stats['total_emails']} total emails")
-    log("✨ Crawl optimization complete!")
+    # Only show final summary if user explicitly stopped the crawler
+    if not continuous_running:  # User stopped the crawler
+        total_time = (datetime.now() - start_time).total_seconds()
+        rate = total_processed / total_time if total_time > 0 else 0
+        
+        log("\n" + "=" * 60)
+        log("🏁 AUTO-REPEAT CRAWL STOPPED BY USER!")
+        log(f"📊 FINAL RESULTS:")
+        log(f"   🎯 Cycles completed: {cycle_count}")
+        log(f"   📋 URLs discovered: {total_discovered}")
+        log(f"   ⚡ URLs processed: {total_processed}")
+        log(f"   📧 Emails found: {total_emails}")
+        log(f"   ⏱️ Total time: {total_time:.1f} seconds")
+        log(f"   🚀 Average speed: {rate:.2f} URLs/second")
+        
+        # Final queue stats
+        stats = get_queue_stats()
+        log(f"📈 Queue status: {stats['pending']} pending, {stats['total_emails']} total emails")
+        log("✨ Crawl optimization complete!")
+        log("=" * 60)
+    else:
+        # Crawler was stopped for other reasons (should rarely happen)
+        log("🔄 Crawler paused - this should not normally happen")
+        log("💡 If you see this message, the crawler may have encountered an unexpected condition")
 
-async def ultra_fast_discovery(progress_callback=None, max_locations=15, max_categories=12, target_urls=50, verbose_mode=False):
-    """Ultra-fast URL discovery with concurrent requests"""
+async def ultra_fast_discovery(progress_callback=None, max_locations=10, max_categories=8, target_urls=50, verbose_mode=False):
+    """Conservative URL discovery with manageable concurrency"""
     
     def log(msg, verbose_only=False):
         if progress_callback:
@@ -2105,57 +2273,73 @@ async def ultra_fast_discovery(progress_callback=None, max_locations=15, max_cat
                 progress_callback(msg)
     
     discovered = 0
-    locations = CRAIGSLIST_LOCATIONS[:max_locations]
-    categories = CRAIGSLIST_CATEGORIES[:max_categories]
+    locations = CRAIGSLIST_LOCATIONS[:max_locations]  # Reduced from 15 to 10
+    categories = CRAIGSLIST_CATEGORIES[:max_categories]  # Reduced from 12 to 8
     
     log(f"🌍 Discovering from {len(locations)} locations...")
     
-    # Create all discovery tasks concurrently for MAXIMUM SPEED
-    discovery_tasks = []
-    task_info = []
+    # Process in smaller batches to avoid overwhelming servers
+    batch_size = 20  # Process 20 location/category pairs at a time
+    all_tasks = []
     
     for location in locations:
         for category in categories:
-            if discovered >= target_urls:
-                break
-            task = discover_craigslist_urls(location, category, None)  # No individual logging for speed
-            discovery_tasks.append(task)
-            task_info.append((location, category))
-        if discovered >= target_urls:
+            all_tasks.append((location, category))
+    
+    # Process in batches instead of all at once
+    for i in range(0, len(all_tasks), batch_size):
+        if discovered >= target_urls or not continuous_running:
             break
-    
-    log(f"⚡ Launching {len(discovery_tasks)} concurrent discovery tasks...")
-    
-    try:
-        # Execute all discovery tasks simultaneously
-        results = await asyncio.gather(*discovery_tasks, return_exceptions=True)
+            
+        batch = all_tasks[i:i + batch_size]
+        log(f"⚡ Processing batch {i//batch_size + 1}: {len(batch)} location/category pairs...")
         
-        # Process results quickly
-        for (location, category), result in zip(task_info, results):
-            if not continuous_running or discovered >= target_urls:
-                break
-                
-            if isinstance(result, Exception):
-                log(f"❌ Discovery error {location}/{category}: {str(result)[:50]}...", verbose_only=True)
-                continue  # Skip errors for speed
-                
-            if result:  # URLs found
-                added = add_urls_to_queue(result, location, category)
-                discovered += added
-                
-                if added > 0:
-                    log(f"✅ {location}/{category}: +{added} URLs (total: {discovered})")
-                    log(f"📋 Sample URLs: {[url[:50]+'...' for url in result[:2]]}", verbose_only=True)
-                else:
-                    log(f"⚪ {location}/{category}: No new URLs (duplicates filtered)", verbose_only=True)
-                
-                if discovered >= target_urls:
-                    log(f"🎯 Target reached: {target_urls} URLs discovered")
+        # Create tasks for this batch
+        discovery_tasks = []
+        for location, category in batch:
+            task = discover_craigslist_urls(location, category, None)
+            discovery_tasks.append(task)
+        
+        try:
+            # Execute batch with manageable concurrency
+            results = await asyncio.gather(*discovery_tasks, return_exceptions=True)
+            
+            # Process results
+            for (location, category), result in zip(batch, results):
+                if not continuous_running or discovered >= target_urls:
                     break
+                    
+                if isinstance(result, Exception):
+                    log(f"❌ Discovery error {location}/{category}: {str(result)[:50]}...", verbose_only=True)
+                    continue
+                    
+                if result:  # URLs found
+                    if super_verbose_mode:
+                        log(f"🔍 SUPER VERBOSE: {location}/{category} returned {len(result)} URLs from discovery")
+                    
+                    added = add_urls_to_queue(result, location, category)
+                    discovered += added
+                    
+                    if added > 0:
+                        log(f"✅ {location}/{category}: +{added} URLs (total: {discovered})")
+                        if super_verbose_mode:
+                            log(f"� SUPER VERBOSE: Sample URLs: {[url['url'][:50]+'...' for url in result[:2]]}")
+                    else:
+                        log(f"⚪ {location}/{category}: No new URLs (duplicates/rescans managed)")
+                        if super_verbose_mode:
+                            log(f"🔍 SUPER VERBOSE: All {len(result)} URLs were duplicates or too recent to re-scan")
+                else:
+                    if super_verbose_mode:
+                        log(f"🔍 SUPER VERBOSE: {location}/{category} returned no URLs from discovery")
+                        
+        except Exception as e:
+            log(f"❌ Batch discovery error: {e}")
+        
+        # Brief pause between batches to be respectful
+        if i + batch_size < len(all_tasks) and discovered < target_urls:
+            await asyncio.sleep(1.0)  # 1 second pause between batches
     
-    except Exception as e:
-        log(f"❌ Discovery error: {e}")
-    
+    log(f"🎯 Discovery complete: {discovered} URLs discovered")
     return discovered
 
 async def ultra_fast_processing(progress_callback=None, batch_size=50, verbose_mode=False):
