@@ -1654,7 +1654,73 @@ def is_url_in_database(url):
     result = is_url_in_database_batch([url])
     return result.get(url, False)
 
-# Comprehensive Craigslist Discovery Functions
+async def discover_all_craigslist_locations():
+    """Discover all Craigslist locations by scraping the sites page"""
+    import httpx
+    from bs4 import BeautifulSoup
+    
+    locations = []
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            # Get the main sites page
+            response = await client.get("https://www.craigslist.org/about/sites")
+            if response.status_code == 200:
+                soup = BeautifulSoup(response.text, 'html.parser')
+                
+                # Find all craigslist subdomain links
+                for link in soup.find_all('a', href=True):
+                    href = link['href']
+                    if 'craigslist.org' in href and '//' in href:
+                        # Extract location from URL like https://newyork.craigslist.org
+                        if href.startswith('//'):
+                            href = 'https:' + href
+                        elif href.startswith('http'):
+                            pass
+                        else:
+                            continue
+                            
+                        try:
+                            location = href.split('//')[1].split('.craigslist.org')[0]
+                            if location and location not in locations:
+                                locations.append(location)
+                        except:
+                            continue
+                            
+        print(f"🌍 Discovered {len(locations)} Craigslist locations")
+        return locations[:50]  # Limit to first 50 to avoid being too aggressive initially
+        
+    except Exception as e:
+        print(f"❌ Error discovering locations: {e}")
+        # Fallback to major US cities if discovery fails
+        return ["newyork", "losangeles", "chicago", "houston", "phoenix", "philadelphia", 
+                "sanantonio", "sandiego", "dallas", "austin", "fortworth", "columbus"]
+
+async def discover_categories_from_location(location):
+    """Discover all categories from a location's homepage"""
+    import httpx
+    from bs4 import BeautifulSoup
+    
+    categories = []
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(f"https://{location}.craigslist.org")
+            if response.status_code == 200:
+                soup = BeautifulSoup(response.text, 'html.parser')
+                
+                # Find all category links in the format /search/{category}
+                for link in soup.find_all('a', href=True):
+                    href = link['href']
+                    if href.startswith('/search/') and len(href.split('/')) == 3:
+                        category = href.split('/search/')[1]
+                        if category and len(category) == 3 and category not in categories:
+                            categories.append(category)
+                            
+        print(f"📁 Found {len(categories)} categories for {location}")
+        return categories
+        
+    except Exception as e:
+        print(f"❌ Error discovering categories for {location}: {e}")
+        return []
 async def discover_craigslist_urls(location, category, progress_callback=None):
     """Discover URLs by parsing Craigslist category listing pages (NOT individual posts)"""
     
@@ -1685,6 +1751,8 @@ async def discover_craigslist_urls(location, category, progress_callback=None):
             if progress_callback and super_verbose_mode:
                 log(f"🔍 SUPER VERBOSE: Using general URL format: {listing_url}")
         
+        # Always log the URL being attempted (not just in super verbose mode)
+        log(f"🌐 ATTEMPTING URL: {listing_url}")
         log(f"🔍 Discovering URLs from category listing: {listing_url}")
         
         # Super verbose mode logging
@@ -1700,187 +1768,184 @@ async def discover_craigslist_urls(location, category, progress_callback=None):
             follow_redirects=True
         ) as client:
             
-            # First try the current URL format
-            response = await client.get(listing_url)
+            # Paginate through results using the thumb parameter
+            page = 0
+            max_pages = 10  # Limit to prevent infinite loops
             
-            if progress_callback and super_verbose_mode:
-                log(f"🔍 SUPER VERBOSE: HTTP {response.status_code} for {listing_url}")
-                log(f"🔍 SUPER VERBOSE: Response length: {len(response.text)} characters")
-                log(f"🔍 SUPER VERBOSE: First 500 chars: {response.text[:500]}")
+            while page < max_pages:
+                # Add pagination parameter to URL
+                if page == 0:
+                    paginated_url = listing_url
+                else:
+                    # Use query parameter for server-side pagination
+                    offset = page * 120  # Assuming ~120 results per page
+                    paginated_url = f"{listing_url}?s={offset}"
                 
-            # If we get a 404 or redirect, try alternative URL formats
-            if response.status_code == 404 or 'craigslist' not in response.text.lower():
+                log(f"📄 Checking page {page}: {paginated_url}")
                 if progress_callback and super_verbose_mode:
-                    log(f"🔍 SUPER VERBOSE: Primary URL failed, trying alternative formats...")
+                    log(f"🔍 SUPER VERBOSE: Trying page {page}: {paginated_url}")
                 
-                # Try different URL formats
-                alt_urls = [
-                    f"{base_url}/d/jobs/{category}",  # Jobs direct
-                    f"{base_url}/d/gigs/{category}",  # Gigs
-                    f"{base_url}/d/for-sale/{category}",  # For sale  
-                    f"{base_url}/d/services/{category}",  # Services
-                    f"{base_url}/{category}",  # Simple format
-                ]
+                # First try the current URL format
+                response = await client.get(paginated_url)
                 
-                for alt_url in alt_urls:
-                    try:
-                        if progress_callback and super_verbose_mode:
-                            log(f"🔍 SUPER VERBOSE: Trying alternative URL: {alt_url}")
-                        
-                        alt_response = await client.get(alt_url)
-                        if alt_response.status_code == 200 and 'craigslist' in alt_response.text.lower():
-                            response = alt_response
-                            listing_url = alt_url
+                if progress_callback and super_verbose_mode:
+                    log(f"🔍 SUPER VERBOSE: HTTP {response.status_code} for {paginated_url}")
+                    log(f"🔍 SUPER VERBOSE: Response length: {len(response.text)} characters")
+                    log(f"🔍 SUPER VERBOSE: First 500 chars: {response.text[:500]}")
+                    
+                # If we get a 404 or redirect on first page, try alternative URL formats
+                if page == 0 and (response.status_code == 404 or 'craigslist' not in response.text.lower()):
+                    if progress_callback and super_verbose_mode:
+                        log(f"🔍 SUPER VERBOSE: Primary URL failed, trying alternative formats...")
+                    
+                    # Try different URL formats
+                    alt_urls = [
+                        f"{base_url}/d/jobs/{category}",  # Jobs direct
+                        f"{base_url}/d/gigs/{category}",  # Gigs
+                        f"{base_url}/d/for-sale/{category}",  # For sale  
+                        f"{base_url}/d/services/{category}",  # Services
+                        f"{base_url}/{category}",  # Simple format
+                    ]
+                    
+                    for alt_url in alt_urls:
+                        try:
+                            log(f"🔄 TRYING ALTERNATIVE URL: {alt_url}")
                             if progress_callback and super_verbose_mode:
-                                log(f"🔍 SUPER VERBOSE: Alternative URL worked: {alt_url}")
-                            break
+                                log(f"🔍 SUPER VERBOSE: Trying alternative URL: {alt_url}")
+                            
+                            alt_response = await client.get(alt_url)
+                            if alt_response.status_code == 200 and 'craigslist' in alt_response.text.lower():
+                                response = alt_response
+                                listing_url = alt_url  # Update base URL for pagination
+                                log(f"✅ ALTERNATIVE URL WORKED: {alt_url}")
+                                if progress_callback and super_verbose_mode:
+                                    log(f"🔍 SUPER VERBOSE: Alternative URL worked: {alt_url}")
+                                break
+                            else:
+                                log(f"❌ ALTERNATIVE URL FAILED: {alt_url} (Status: {alt_response.status_code})")
+                        except Exception as e:
+                            log(f"❌ ALTERNATIVE URL ERROR: {alt_url} - {e}")
+                            if progress_callback and super_verbose_mode:
+                                log(f"🔍 SUPER VERBOSE: Alternative URL {alt_url} failed: {e}")
+                            continue
+                
+                if response.status_code != 200:
+                    if progress_callback and super_verbose_mode:
+                        log(f"🔍 SUPER VERBOSE: Failed to fetch listing page: HTTP {response.status_code}")
+                    log(f"❌ Failed to fetch listing page: HTTP {response.status_code}")
+                    break  # Exit pagination loop
+                
+                soup = BeautifulSoup(response.text, 'html.parser')
+                
+                # Check if page is valid Craigslist listing page
+                if progress_callback and super_verbose_mode:
+                    log(f"🔍 SUPER VERBOSE: Looking for Craigslist elements...")
+                    log(f"🔍 SUPER VERBOSE: Page title: {soup.title.string if soup.title else 'No title'}")
+                    log(f"🔍 SUPER VERBOSE: Has 'craigslist' in text: {'craigslist' in response.text.lower()}")
+                    
+                    # Check for common Craigslist elements
+                    has_header = soup.find('header', class_='cl-header')
+                    has_search = soup.find('form', class_='cl-search-form')
+                    has_results = soup.find('div', class_='cl-results-page')
+                    
+                    log(f"🔍 SUPER VERBOSE: Has CL header: {bool(has_header)}")
+                    log(f"🔍 SUPER VERBOSE: Has search form: {bool(has_search)}")
+                    log(f"🔍 SUPER VERBOSE: Has results page: {bool(has_results)}")
+                
+                # Find all post links in the listing
+                post_links = []
+                
+                # Try the new Craigslist structure first
+                search_results = soup.find_all('li', class_='cl-static-search-result')
+                if search_results:
+                    for result in search_results:
+                        link = result.find('a', href=True)
+                        if link:
+                            post_links.append(link)
+                
+                # Fallback to older structures
+                if not post_links:
+                    post_links = soup.find_all('a', class_='cl-app-anchor')
+                if not post_links:
+                    post_links = soup.find_all('a', {'data-id': True})
+                if not post_links:
+                    # Try href pattern matching for Craigslist posts
+                    all_links = soup.find_all('a', href=True)
+                    post_links = [link for link in all_links if '/d/' in link['href'] and any(char.isdigit() for char in link['href'])]
+                
+                # Debug: Show what we found
+                if progress_callback and super_verbose_mode:
+                    log(f"🔍 SUPER VERBOSE: Page {page} - Raw HTML title: {soup.title.string if soup.title else 'No title'}")
+                    
+                    # Show first few links to understand structure
+                    all_links = soup.find_all('a', href=True)[:15]
+                    log(f"🔍 SUPER VERBOSE: Page {page} - Found {len(all_links)} total links, showing first 15:")
+                    for i, link in enumerate(all_links):
+                        href = link.get('href', '')
+                        text = link.get_text(strip=True)[:50]
+                        log(f"🔍 SUPER VERBOSE:   Link {i+1}: '{text}' -> {href}")
+                
+                log(f"📄 Page {page}: Found {len(post_links)} posts")
+                
+                if progress_callback and super_verbose_mode:
+                    log(f"🔍 SUPER VERBOSE: Found {len(post_links)} potential post links on page {page}")
+                
+                # If no posts found on this page, we've reached the end
+                if len(post_links) == 0:
+                    log(f"📄 No more posts found on page {page}, ending pagination")
+                    break
+                
+                # Process links found on this page
+                page_urls = 0
+                for link in post_links:
+                    try:
+                        href = link.get('href', '')
+                        if not href:
+                            continue
+                        
+                        # Convert relative URLs to absolute
+                        if href.startswith('/'):
+                            full_url = base_url + href
+                        elif href.startswith('http'):
+                            full_url = href
+                        else:
+                            continue
+                        
+                        # Only include actual Craigslist post URLs
+                        # Expected format: https://sanantonio.craigslist.org/aos/d/san-antonio-xxxxx/7874965162.html
+                        if ('/d/' in full_url and full_url.endswith('.html') and 
+                            any(char.isdigit() for char in full_url.split('/')[-1])):
+                            # Check if URL already exists in database
+                            if not is_url_in_database(full_url):
+                                title = link.get_text(strip=True) or "No title"
+                                
+                                discovered_urls.append({
+                                    'url': full_url,
+                                    'title': title,
+                                    'location': location,
+                                    'category': category
+                                })
+                                page_urls += 1
+                                
+                                if progress_callback and super_verbose_mode:
+                                    log(f"🔍 SUPER VERBOSE: Added URL from page {page}: {full_url}")
                     except Exception as e:
                         if progress_callback and super_verbose_mode:
-                            log(f"🔍 SUPER VERBOSE: Alternative URL {alt_url} failed: {e}")
+                            log(f"🔍 SUPER VERBOSE: Error processing link: {e}")
                         continue
-            
-            # Check if page is valid Craigslist listing page
-            if progress_callback and super_verbose_mode:
-                log(f"🔍 SUPER VERBOSE: Looking for Craigslist elements...")
-                log(f"🔍 SUPER VERBOSE: Page title: {soup.title.string if soup.title else 'No title'}")
-                log(f"🔍 SUPER VERBOSE: Has 'craigslist' in text: {'craigslist' in response.text.lower()}")
                 
-                # Check for common Craigslist elements
-                has_header = soup.find('header', class_='cl-header')
-                has_search = soup.find('form', class_='cl-search-form')
-                has_results = soup.find('div', class_='cl-results-page')
+                log(f"📄 Page {page}: Added {page_urls} new URLs")
                 
-                log(f"🔍 SUPER VERBOSE: Has CL header: {bool(has_header)}")
-                log(f"🔍 SUPER VERBOSE: Has search form: {bool(has_search)}")
-                log(f"🔍 SUPER VERBOSE: Has results page: {bool(has_results)}")
-            
-            if response.status_code != 200:
-                if progress_callback and super_verbose_mode:
-                    log(f"🔍 SUPER VERBOSE: Failed to fetch listing page: HTTP {response.status_code}")
-                log(f"❌ Failed to fetch listing page: HTTP {response.status_code}")
-                return []
-            
-            soup = BeautifulSoup(response.text, 'html.parser')
-            
-            # Find all post links in the listing
-            post_links = soup.find_all('a', class_='cl-app-anchor')
-            if not post_links:
-                # Try alternative selectors
-                post_links = soup.find_all('a', {'data-id': True})
-            if not post_links:
-                # Try href pattern matching for Craigslist posts
-                all_links = soup.find_all('a', href=True)
-                post_links = [link for link in all_links if '/d/' in link['href'] and any(char.isdigit() for char in link['href'])]
-            
-            log(f"📄 Found {len(post_links)} posts in category listing")
-            
-            if progress_callback and super_verbose_mode:
-                log(f"🔍 SUPER VERBOSE: Found {len(post_links)} potential post links on {listing_url}")
-                # Show some sample link structures to debug
-                all_links = soup.find_all('a', href=True)[:10]  # First 10 links
-                log(f"🔍 SUPER VERBOSE: Sample links found on page:")
-                for i, link in enumerate(all_links):
-                    href = link.get('href', '')[:100]  # Truncate long URLs
-                    class_name = link.get('class', [])
-                    log(f"🔍 SUPER VERBOSE:   Link {i+1}: href='{href}' class='{class_name}'")
+                # Move to next page
+                page += 1
                 
-                # Check if page has the expected structure
-                if "craigslist" in response.text.lower():
-                    log(f"🔍 SUPER VERBOSE: Page contains 'craigslist' text - appears to be a real CL page")
-                else:
-                    log(f"🔍 SUPER VERBOSE: WARNING: Page doesn't contain 'craigslist' text - might be blocked/error page")
-                
-                # Check for specific error indicators
-                if "blocked" in response.text.lower() or "bot" in response.text.lower():
-                    log(f"🔍 SUPER VERBOSE: WARNING: Page content suggests we might be blocked")
-            
-            for link in post_links:
-                try:
-                    href = link.get('href', '')
-                    if not href:
-                        continue
-                    
-                    # Convert relative URLs to absolute
-                    if href.startswith('/'):
-                        full_url = base_url + href
-                    elif href.startswith('http'):
-                        full_url = href
-                    else:
-                        continue
-                    
-                    # Only include actual Craigslist post URLs
-                    if '/d/' in full_url and full_url.endswith('.html'):
-                        # Check if URL already exists in database
-                        if not is_url_in_database(full_url):
-                            title = link.get_text(strip=True) or "No title"
-                            
-                            discovered_urls.append({
-                                'url': full_url,
-                                'title': title,
-                                'location': location,
-                                'category': category
-                            })
-                            
-                            if progress_callback and super_verbose_mode:
-                                log(f"🔍 SUPER VERBOSE: NEW URL FOUND: {full_url}")
-                                log(f"🔍 SUPER VERBOSE: Title: {title[:80]}...")
-                            
-                            # Log every 50 discoveries
-                            if len(discovered_urls) % 50 == 0:
-                                log(f"📊 Discovered {len(discovered_urls)} new URLs so far...")
-                        else:
-                            if progress_callback and super_verbose_mode:
-                                log(f"🔍 SUPER VERBOSE: DUPLICATE URL (already in DB): {full_url}")
-                        
-                except Exception as e:
-                    continue
-            
-            # Try to get more pages by following pagination
-            next_links = soup.find_all('a', {'class': 'button next'})
-            page_count = 1
-            
-            for next_link in next_links[:3]:  # Limit to 3 additional pages for speed
-                try:
-                    next_href = next_link.get('href')
-                    if next_href and next_href.startswith('/'):
-                        next_url = base_url + next_href
-                        page_count += 1
-                        log(f"📖 Scanning page {page_count}...")
-                        
-                        next_response = await client.get(next_url)
-                        if next_response.status_code == 200:
-                            next_soup = BeautifulSoup(next_response.text, 'html.parser')
-                            next_post_links = next_soup.find_all('a', class_='cl-app-anchor')
-                            
-                            for link in next_post_links:
-                                try:
-                                    href = link.get('href', '')
-                                    if href.startswith('/'):
-                                        full_url = base_url + href
-                                    elif href.startswith('http'):
-                                        full_url = href
-                                    else:
-                                        continue
-                                    
-                                    if '/d/' in full_url and full_url.endswith('.html'):
-                                        if not is_url_in_database(full_url):
-                                            title = link.get_text(strip=True) or "No title"
-                                            discovered_urls.append({
-                                                'url': full_url,
-                                                'title': title,
-                                                'location': location,
-                                                'category': category
-                                            })
-                                except Exception:
-                                    continue
-                                    
-                        await asyncio.sleep(1)  # Rate limiting between pages
-                        
-                except Exception as e:
-                    break
+            # End of pagination loop
+            log(f"🎯 Total URLs discovered: {len(discovered_urls)} from {page} pages")
         
-        log(f"✅ Discovery complete: Found {len(discovered_urls)} new URLs for {location}/{category}")
-        return discovered_urls
+        if progress_callback and super_verbose_mode:
+            log(f"🔍 SUPER VERBOSE: {location}/{category} - Final result: {len(discovered_urls)} URLs")
+        
+        return discovered_urls  # Return full objects with url, title, location, category
         
     except Exception as e:
         log(f"❌ Error discovering URLs: {str(e)}")
@@ -2323,7 +2388,7 @@ async def ultra_fast_discovery(progress_callback=None, max_locations=10, max_cat
                     if added > 0:
                         log(f"✅ {location}/{category}: +{added} URLs (total: {discovered})")
                         if super_verbose_mode:
-                            log(f"� SUPER VERBOSE: Sample URLs: {[url['url'][:50]+'...' for url in result[:2]]}")
+                            log(f"� SUPER VERBOSE: Sample URLs: {[url[:50]+'...' for url in result[:2]]}")
                     else:
                         log(f"⚪ {location}/{category}: No new URLs (duplicates/rescans managed)")
                         if super_verbose_mode:
