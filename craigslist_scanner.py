@@ -198,7 +198,11 @@ def add_urls_to_queue(urls_data, location="", category=""):
     """Add discovered URLs to scanning queue, allowing re-scan of old URLs"""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    
+
+    # Debug logging for comprehensive discovery
+    if super_verbose_mode:
+        print(f"🔍 SUPER VERBOSE: add_urls_to_queue called with {len(urls_data)} URLs for {location}/{category}")
+
     added_count = 0
     for url_data in urls_data:
         try:
@@ -271,9 +275,22 @@ def add_urls_to_queue(urls_data, location="", category=""):
     conn.commit()
     conn.close()
     
+    # Enhanced debug logging
     if super_verbose_mode:
         print(f"🔍 SUPER VERBOSE: Queue operation complete - {added_count} URLs added/updated")
     
+    # Additional verification for comprehensive discovery
+    if added_count > 0:
+        # Quick verification - check if URLs were actually saved
+        verify_conn = sqlite3.connect(DB_PATH)
+        verify_cursor = verify_conn.cursor()
+        verify_cursor.execute('SELECT COUNT(*) FROM url_queue WHERE status = "pending"')
+        current_pending = verify_cursor.fetchone()[0]
+        verify_conn.close()
+        
+        if super_verbose_mode:
+            print(f"🔍 SUPER VERBOSE: After commit, total pending URLs in database: {current_pending}")
+
     return added_count
 
 def get_next_urls_to_scan(limit=10):
@@ -1768,17 +1785,18 @@ async def discover_craigslist_urls(location, category, progress_callback=None):
             follow_redirects=True
         ) as client:
             
-            # Paginate through results using the thumb parameter
+            # Paginate through results using query parameters
             page = 0
-            max_pages = 10  # Limit to prevent infinite loops
+            max_pages = 300  # Increased to 300 pages as requested
+            results_per_page = 120  # Craigslist typically shows ~120 results per page
             
             while page < max_pages:
                 # Add pagination parameter to URL
                 if page == 0:
                     paginated_url = listing_url
                 else:
-                    # Use query parameter for server-side pagination
-                    offset = page * 120  # Assuming ~120 results per page
+                    # Use the format: /search/category?s=offset
+                    offset = page * results_per_page
                     paginated_url = f"{listing_url}?s={offset}"
                 
                 log(f"📄 Checking page {page}: {paginated_url}")
@@ -2329,6 +2347,104 @@ async def optimized_auto_repeat_crawl(progress_callback=None, auto_optimize=True
         log("🔄 Crawler paused - this should not normally happen")
         log("💡 If you see this message, the crawler may have encountered an unexpected condition")
 
+async def comprehensive_discovery(progress_callback=None, target_urls=500000):
+    """Comprehensive discovery across all Craigslist locations and categories"""
+    
+    def log(msg):
+        if progress_callback:
+            progress_callback(msg)
+    
+    log("🌍 Starting comprehensive Craigslist discovery...")
+    log("🎯 Target: ~10,000 URLs per site across all locations")
+    
+    # Step 1: Discover all locations
+    log("🔍 Discovering all Craigslist locations...")
+    locations = await discover_all_craigslist_locations()
+    log(f"📍 Found {len(locations)} locations to scan")
+    
+    # Step 2: Process each location with per-site limit
+    total_discovered = 0
+    sites_processed = 0
+    target_per_site = 10000
+    
+    for location in locations:
+        log(f"📁 Processing site: {location}")
+        
+        # Discover categories for this location
+        categories = await discover_categories_from_location(location)
+        
+        if not categories:
+            log(f"⚠️ {location}: No categories found, using defaults")
+            # Fallback to major categories if discovery fails
+            categories = ["jjj", "acc", "ofc", "bus", "csr", "etc", "fbh", "gov", "hea", "hum", "eng", "edu"]
+        
+        log(f"✅ {location}: {len(categories)} categories found")
+        
+        # Process categories for this location
+        site_discovered = 0
+        batch_size = 5
+        
+        for i in range(0, len(categories), batch_size):
+            batch_categories = categories[i:i + batch_size]
+            
+            # Process batch concurrently
+            tasks = []
+            for category in batch_categories:
+                task = discover_craigslist_urls(location, category, progress_callback)
+                tasks.append(task)
+            
+            try:
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                
+                for j, result in enumerate(results):
+                    category = batch_categories[j]
+                    
+                    if isinstance(result, Exception):
+                        log(f"❌ Discovery error {location}/{category}: {str(result)[:50]}...")
+                        continue
+                        
+                    if result:  # URLs found
+                        if super_verbose_mode:
+                            log(f"🔍 SUPER VERBOSE: {location}/{category} returned {len(result)} URLs from discovery")
+                        
+                        added = add_urls_to_queue(result, location, category)
+                        site_discovered += added
+                        total_discovered += added
+                        
+                        if added > 0:
+                            log(f"✅ {location}/{category}: +{added} URLs (site: {site_discovered}, total: {total_discovered})")
+                        else:
+                            log(f"⚪ {location}/{category}: No new URLs")
+                            
+                        # Stop this site if we've reached per-site target
+                        if site_discovered >= target_per_site:
+                            log(f"🎯 Site {location} target reached: {site_discovered} URLs")
+                            break
+                            
+            except Exception as e:
+                log(f"❌ Batch discovery error for {location}: {e}")
+            
+            # Stop this site if target reached
+            if site_discovered >= target_per_site:
+                break
+                
+            # Brief pause between batches
+            await asyncio.sleep(0.5)
+        
+        sites_processed += 1
+        log(f"🏁 {location} complete: {site_discovered} URLs discovered ({sites_processed} sites processed)")
+        
+        # Stop if we've reached overall target
+        if total_discovered >= target_urls:
+            log(f"🎯 Overall target reached: {total_discovered} URLs across {sites_processed} sites")
+            return total_discovered
+        
+        # Brief pause between sites
+        await asyncio.sleep(1.0)
+    
+    log(f"🏁 Comprehensive discovery complete: {total_discovered} URLs from {sites_processed} sites")
+    return total_discovered
+
 async def ultra_fast_discovery(progress_callback=None, max_locations=10, max_categories=8, target_urls=50, verbose_mode=False):
     """Conservative URL discovery with manageable concurrency"""
     
@@ -2588,6 +2704,16 @@ def create_interface():
                                 variant="stop", 
                                 size="lg"
                             )
+                        
+                        # Comprehensive discovery button
+                        with gr.Row():
+                            comprehensive_btn = gr.Button(
+                                "🌍 COMPREHENSIVE DISCOVERY (All Locations)", 
+                                variant="secondary", 
+                                size="lg"
+                            )
+                        
+                        gr.Markdown("**🌍 Comprehensive Mode:** Discovers ALL Craigslist locations and categories automatically, then scans up to 300 pages each!")
                         
                         # Live stats
                         auto_status = gr.Markdown("**Status:** Ready to start")
@@ -3033,6 +3159,39 @@ When enabled, the scanner will automatically change VPN countries every 10-15 se
         auto_stop_btn.click(
             stop_auto_repeat_crawler,
             outputs=[auto_status, auto_live_output, auto_stats]
+        )
+        
+        # Connect comprehensive discovery
+        def start_comprehensive_discovery():
+            """Start comprehensive discovery in background"""
+            
+            # Use threading to run the async function
+            import threading
+            
+            def run_comprehensive_sync():
+                try:
+                    manage_auto_output("🌍 Starting comprehensive discovery...")
+                    # Create new event loop for this thread
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    discovered = loop.run_until_complete(comprehensive_discovery(
+                        progress_callback=lambda msg: manage_auto_output(msg),
+                        target_urls=500000  # Allow discovery across many sites, ~10k per site
+                    ))
+                    manage_auto_output(f"🏁 Comprehensive discovery complete: {discovered} URLs")
+                    loop.close()
+                except Exception as e:
+                    manage_auto_output(f"❌ Comprehensive discovery error: {e}")
+            
+            # Start the task in a separate thread
+            thread = threading.Thread(target=run_comprehensive_sync, daemon=True)
+            thread.start()
+            
+            return "🌍 Comprehensive discovery started..."
+        
+        comprehensive_btn.click(
+            start_comprehensive_discovery,
+            outputs=[auto_live_output]
         )
         
         # Auto-refresh functionality for live output
