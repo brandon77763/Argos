@@ -34,6 +34,32 @@ DEFAULT_COLUMNS = ["first_name", "last_name", "title", "company_name", "email", 
 continuous_running = False
 continuous_thread = None
 
+# Auto Repeat Crawler live output management
+auto_crawler_output = ""
+super_verbose_mode = False
+MAX_OUTPUT_CHARS = 40000  # Keep last 40k characters
+
+def manage_auto_output(new_message):
+    """Manage auto crawler output with character limit"""
+    global auto_crawler_output
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    auto_crawler_output += f"[{timestamp}] {new_message}\n"
+    
+    # Keep only last 40k characters
+    if len(auto_crawler_output) > MAX_OUTPUT_CHARS:
+        auto_crawler_output = auto_crawler_output[-MAX_OUTPUT_CHARS:]
+    
+    return auto_crawler_output
+
+def get_auto_output():
+    """Get current auto crawler output"""
+    return auto_crawler_output
+
+def clear_auto_output():
+    """Clear auto crawler output"""
+    global auto_crawler_output
+    auto_crawler_output = ""
+
 # Verbose console: keep only the last 10,000 lines
 VERBOSE_MAX_LINES = 10000
 _verbose_buffer = deque(maxlen=VERBOSE_MAX_LINES)
@@ -262,6 +288,15 @@ def get_queue_stats():
         'failed': stats[3] or 0,
         'total_emails': stats[4] or 0
     }
+
+def get_email_count():
+    """Get total count of emails found"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('SELECT COUNT(*) FROM emails')
+    count = cursor.fetchone()[0]
+    conn.close()
+    return count or 0
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
@@ -1579,42 +1614,66 @@ async def process_url_queue(progress_callback=None, batch_size=10, max_cycles=10
         log(f"📄 Processing {len(urls_to_scan)} URLs from queue (Cycle {cycles})...")
         
         cycle_processed = 0
+        
+        # Process URLs concurrently for MAXIMUM SPEED
+        batch_tasks = []
+        url_data = []
+        
         for url_id, url, location, category in urls_to_scan:
             if not continuous_running:
                 break
-                
-            try:
-                log(f"🔍 Scanning [{cycles}-{cycle_processed+1}]: {url[:60]}...")
-                
-                # Extract emails from this URL
-                email_data = await extract_emails_from_post(url, f"Queue scan")
-                
-                emails_found = 0
-                if email_data and email_data['email']:
-                    # Save to database
-                    db_tuple = (
-                        email_data['first_name'], email_data['last_name'], email_data['title'],
-                        email_data['company_name'], email_data['email'], email_data['phone'],
-                        email_data['stage'], email_data['linkedin_url'], email_data['location'],
-                        email_data['category'], email_data['url'], email_data['scan_date'],
-                        email_data['raw_name'], email_data['raw_post_title']
-                    )
-                    save_email_to_db(db_tuple)
-                    emails_found = 1
-                    log(f"✅ Found email: {email_data['email']}")
-                
-                # Mark as scanned
-                mark_url_scanned(url_id, emails_found)
-                cycle_processed += 1
-                processed_total += 1
-                
-                # ULTRA FAST - minimal delay
-                await asyncio.sleep(0.1)
-                
-            except Exception as e:
-                log(f"❌ Error processing {url}: {str(e)}")
-                mark_url_scanned(url_id, 0, str(e))
-                continue
+            task = extract_emails_from_post(url, f"Queue scan")
+            batch_tasks.append(task)
+            url_data.append((url_id, url, location, category))
+        
+        # Execute all tasks concurrently
+        try:
+            results = await asyncio.gather(*batch_tasks, return_exceptions=True)
+            
+            # Process results quickly
+            for idx, (result, (url_id, url, location, category)) in enumerate(zip(results, url_data)):
+                if not continuous_running:
+                    break
+                    
+                try:
+                    emails_found = 0
+                    
+                    if isinstance(result, Exception):
+                        log(f"❌ [{idx+1}] Error: {str(result)[:50]}...")
+                        mark_url_scanned(url_id, 0, str(result))
+                        continue
+                    
+                    email_data = result
+                    if email_data and email_data.get('email'):
+                        # Save to database efficiently
+                        db_tuple = (
+                            email_data['first_name'], email_data['last_name'], email_data['title'],
+                            email_data['company_name'], email_data['email'], email_data['phone'],
+                            email_data['stage'], email_data['linkedin_url'], email_data['location'],
+                            email_data['category'], email_data['url'], email_data['scan_date'],
+                            email_data['raw_name'], email_data['raw_post_title']
+                        )
+                        save_email_to_db(db_tuple)
+                        emails_found = 1
+                        log(f"✅ [{idx+1}] Email: {email_data['email'][:25]}...")
+                    else:
+                        log(f"⚪ [{idx+1}] No email found")
+                    
+                    # Mark as scanned
+                    mark_url_scanned(url_id, emails_found)
+                    cycle_processed += 1
+                    processed_total += 1
+                    
+                except Exception as e:
+                    log(f"❌ Error saving result {idx+1}: {e}")
+                    mark_url_scanned(url_id, 0, str(e))
+                    continue
+                    
+        except Exception as e:
+            log(f"❌ Batch processing error: {e}")
+            # Quick fallback - mark all as failed
+            for url_id, url, location, category in url_data:
+                mark_url_scanned(url_id, 0, "Batch processing failed")
         
         log(f"📊 Cycle {cycles} complete: Processed {cycle_processed} URLs")
         
@@ -1632,34 +1691,359 @@ async def process_url_queue(progress_callback=None, batch_size=10, max_cycles=10
     
     return processed_total
 
-async def full_crawl_cycle(progress_callback=None, max_locations=10, max_categories=10, batch_size=20):
-    """Complete crawl cycle: Discovery + Queue Processing + Repeat"""
+async def full_crawl_cycle(progress_callback=None, max_locations=10, max_categories=10, batch_size=20, urls_per_cycle=50):
+    """Complete crawl cycle: Discover some URLs → Process them → Repeat"""
     
     def log(msg):
         if progress_callback:
             progress_callback(msg)
     
     log("🚀 Starting FULL CRAWL CYCLE...")
-    log("📋 Phase 1: Discovery - Finding new URLs")
     
-    # Phase 1: Discovery
-    discovered = await comprehensive_craigslist_crawl(progress_callback, max_locations, max_categories)
+    # Phase 1: Limited Discovery - just get some URLs to start processing
+    log(f"📋 Phase 1: Discovery - Finding {urls_per_cycle} new URLs")
+    
+    discovered = await discover_limited_urls(progress_callback, max_locations, max_categories, urls_per_cycle)
     
     if not continuous_running:
-        return
+        return discovered, 0
     
     log(f"✅ Discovery complete. Found {discovered} new URLs")
-    log("📧 Phase 2: Processing - Extracting emails from URLs")
     
-    # Phase 2: Process the queue
-    processed = await process_url_queue(progress_callback, batch_size, max_cycles=5)
+    if discovered == 0:
+        log("⚠️ No new URLs found - queue may be fully processed")
+        return 0, 0
     
-    log(f"🎉 FULL CRAWL CYCLE COMPLETE!")
-    log(f"📊 Summary: {discovered} URLs discovered, {processed} URLs processed")
+    log("📧 Phase 2: Processing - Extracting emails from discovered URLs")
     
-    # Show final stats
+    # Phase 2: Process what we just discovered
+    processed = await process_url_queue(progress_callback, batch_size, max_cycles=3)
+    
+    log(f"🎉 CRAWL CYCLE COMPLETE!")
+    log(f"📊 This cycle: {discovered} URLs discovered, {processed} URLs processed")
+    
+    return discovered, processed
+
+async def discover_limited_urls(progress_callback=None, max_locations=10, max_categories=10, target_urls=50):
+    """Discover a limited number of URLs quickly"""
+    
+    def log(msg):
+        if progress_callback:
+            progress_callback(msg)
+    
+    total_discovered = 0
+    locations_to_crawl = CRAIGSLIST_LOCATIONS[:max_locations]
+    categories_to_crawl = CRAIGSLIST_CATEGORIES[:max_categories]
+    
+    for i, location in enumerate(locations_to_crawl, 1):
+        if not continuous_running or total_discovered >= target_urls:
+            break
+            
+        log(f"🌍 Crawling location {i}/{len(locations_to_crawl)}: {location}")
+        
+        for j, category in enumerate(categories_to_crawl, 1):
+            if not continuous_running or total_discovered >= target_urls:
+                break
+                
+            try:
+                log(f"📂 Category {j}/{len(categories_to_crawl)}: {category}")
+                
+                # Discover URLs for this location/category
+                urls = await discover_craigslist_urls(location, category, progress_callback)
+                
+                if urls:
+                    # Add to URL queue
+                    added = add_urls_to_queue(urls, location, category)
+                    total_discovered += added
+                    log(f"✅ Added {added} new URLs (Total: {total_discovered})")
+                    
+                    # Stop if we've reached our target
+                    if total_discovered >= target_urls:
+                        log(f"🎯 Reached target of {target_urls} URLs")
+                        break
+                
+                # Very brief delay between categories
+                await asyncio.sleep(0.1)
+                
+            except Exception as e:
+                log(f"❌ Error crawling {location}/{category}: {str(e)}")
+                continue
+        
+        # Brief delay between locations  
+        await asyncio.sleep(0.2)
+        
+        # Stop if we've reached our target
+        if total_discovered >= target_urls:
+            break
+    
+    log(f"✅ Limited discovery complete! Found {total_discovered} new URLs")
+    return total_discovered
+
+async def optimized_auto_repeat_crawl(progress_callback=None, urls_per_cycle=50, max_cycles=20, verbose_mode=False):
+    """OPTIMIZED Auto-Repeat Crawl: Maximum speed, maximum efficiency, live output"""
+    
+    global super_verbose_mode
+    super_verbose_mode = verbose_mode
+    
+    def log(msg, verbose_only=False):
+        if progress_callback:
+            if not verbose_only or super_verbose_mode:
+                progress_callback(msg)
+    
+    log("� OPTIMIZED AUTO-REPEAT CRAWLER STARTING...")
+    log("⚡ Configuration: ULTRA FAST mode with concurrent processing")
+    log(f"🎯 Target: {urls_per_cycle} URLs per cycle, {max_cycles} max cycles")
+    log("=" * 60)
+    
+    total_discovered = 0
+    total_processed = 0
+    total_emails = 0
+    start_time = datetime.now()
+    
+    # Optimal settings for maximum speed
+    max_locations = 15  # Good coverage
+    max_categories = 12  # Most active categories
+    batch_size = 50     # Large batches for efficiency
+    
+    log(f"🌍 Scanning {max_locations} locations x {max_categories} categories")
+    log(f"⚡ Batch processing: {batch_size} URLs at once")
+    
+    for cycle in range(1, max_cycles + 1):
+        if not continuous_running:
+            log("🛑 STOPPED by user")
+            break
+            
+        cycle_start = datetime.now()
+        log(f"\n🔄 ===== CYCLE {cycle}/{max_cycles} =====")
+        
+        # PHASE 1: Check for existing pending URLs first, then discover if needed
+        queue_stats = get_queue_stats()
+        
+        if super_verbose_mode:
+            log(f"📊 Pre-cycle queue: {queue_stats['pending']} pending, {queue_stats['scanned']} scanned")
+        
+        if queue_stats['pending'] >= urls_per_cycle:
+            log(f"📋 Phase 1: Processing existing {queue_stats['pending']} pending URLs (skipping discovery)")
+            discovered = 0  # No need to discover, we have plenty pending
+            
+            if super_verbose_mode:
+                log(f"💡 Strategy: Using existing pending URLs - no discovery needed this cycle")
+        else:
+            log(f"📋 Phase 1: Lightning-fast URL discovery (target: {urls_per_cycle})")
+            discovered = await ultra_fast_discovery(progress_callback, max_locations, max_categories, urls_per_cycle, verbose_mode)
+            total_discovered += discovered
+        
+        if discovered == 0:
+            log(f"⚠️ No new URLs found in cycle {cycle}")
+            log("💡 This might mean we've found all available posts")
+            if cycle > 3:  # Only break after a few cycles
+                log("🏁 Ending crawl - no more URLs available")
+                break
+            else:
+                log("� Continuing to next cycle anyway...")
+                continue
+        
+        log(f"✅ Discovery complete: {discovered} new URLs found")
+        
+        # PHASE 2: CONCURRENT PROCESSING
+        log(f"📧 Phase 2: High-speed email extraction")
+        
+        processed, emails_found = await ultra_fast_processing(progress_callback, batch_size, verbose_mode)
+        
+        total_processed += processed
+        total_emails += emails_found
+        
+        # Cycle summary
+        cycle_time = (datetime.now() - cycle_start).total_seconds()
+        log(f"🎉 CYCLE {cycle} COMPLETE in {cycle_time:.1f}s")
+        log(f"📊 This cycle: +{discovered} URLs, +{processed} processed, +{emails_found} emails")
+        
+        # Running totals
+        total_time = (datetime.now() - start_time).total_seconds()
+        rate = total_processed / total_time if total_time > 0 else 0
+        log(f"📈 TOTALS: {total_discovered} URLs found, {total_processed} processed, {total_emails} emails")
+        log(f"⚡ Speed: {rate:.1f} URLs/second average")
+        
+        # Brief pause between cycles (minimal for speed)
+        if cycle < max_cycles and continuous_running and discovered > 0:
+            log("⏸️ Quick pause before next cycle...")
+            await asyncio.sleep(1)  # Very brief pause
+    
+    # Final summary
+    total_time = (datetime.now() - start_time).total_seconds()
+    rate = total_processed / total_time if total_time > 0 else 0
+    
+    log("\n" + "=" * 60)
+    log("🏁 AUTO-REPEAT CRAWL COMPLETE!")
+    log(f"📊 FINAL RESULTS:")
+    log(f"   🎯 Cycles completed: {cycle}")
+    log(f"   📋 URLs discovered: {total_discovered}")
+    log(f"   ⚡ URLs processed: {total_processed}")
+    log(f"   📧 Emails found: {total_emails}")
+    log(f"   ⏱️ Total time: {total_time:.1f} seconds")
+    log(f"   🚀 Average speed: {rate:.2f} URLs/second")
+    
+    # Final queue stats
     stats = get_queue_stats()
-    log(f"📈 Final stats: {stats['pending']} pending, {stats['scanned']} scanned, {stats['total_emails']} total emails")
+    log(f"📈 Queue status: {stats['pending']} pending, {stats['total_emails']} total emails")
+    log("✨ Crawl optimization complete!")
+
+async def ultra_fast_discovery(progress_callback=None, max_locations=15, max_categories=12, target_urls=50, verbose_mode=False):
+    """Ultra-fast URL discovery with concurrent requests"""
+    
+    def log(msg, verbose_only=False):
+        if progress_callback:
+            if not verbose_only or super_verbose_mode:
+                progress_callback(msg)
+    
+    discovered = 0
+    locations = CRAIGSLIST_LOCATIONS[:max_locations]
+    categories = CRAIGSLIST_CATEGORIES[:max_categories]
+    
+    log(f"🌍 Discovering from {len(locations)} locations...")
+    
+    # Create all discovery tasks concurrently for MAXIMUM SPEED
+    discovery_tasks = []
+    task_info = []
+    
+    for location in locations:
+        for category in categories:
+            if discovered >= target_urls:
+                break
+            task = discover_craigslist_urls(location, category, None)  # No individual logging for speed
+            discovery_tasks.append(task)
+            task_info.append((location, category))
+        if discovered >= target_urls:
+            break
+    
+    log(f"⚡ Launching {len(discovery_tasks)} concurrent discovery tasks...")
+    
+    try:
+        # Execute all discovery tasks simultaneously
+        results = await asyncio.gather(*discovery_tasks, return_exceptions=True)
+        
+        # Process results quickly
+        for (location, category), result in zip(task_info, results):
+            if not continuous_running or discovered >= target_urls:
+                break
+                
+            if isinstance(result, Exception):
+                log(f"❌ Discovery error {location}/{category}: {str(result)[:50]}...", verbose_only=True)
+                continue  # Skip errors for speed
+                
+            if result:  # URLs found
+                added = add_urls_to_queue(result, location, category)
+                discovered += added
+                
+                if added > 0:
+                    log(f"✅ {location}/{category}: +{added} URLs (total: {discovered})")
+                    log(f"📋 Sample URLs: {[url[:50]+'...' for url in result[:2]]}", verbose_only=True)
+                else:
+                    log(f"⚪ {location}/{category}: No new URLs (duplicates filtered)", verbose_only=True)
+                
+                if discovered >= target_urls:
+                    log(f"🎯 Target reached: {target_urls} URLs discovered")
+                    break
+    
+    except Exception as e:
+        log(f"❌ Discovery error: {e}")
+    
+    return discovered
+
+async def ultra_fast_processing(progress_callback=None, batch_size=50, verbose_mode=False):
+    """Ultra-fast URL processing with maximum concurrency"""
+    
+    def log(msg, verbose_only=False):
+        if progress_callback:
+            if not verbose_only or super_verbose_mode:
+                progress_callback(msg)
+    
+    # Get URLs to process
+    urls_to_scan = get_next_urls_to_scan(batch_size * 2)  # Get extra for efficiency
+    
+    if not urls_to_scan:
+        log("⚠️ No URLs to process")
+        return 0, 0
+    
+    log(f"⚡ Processing {len(urls_to_scan)} URLs with maximum concurrency...")
+    
+    processed = 0
+    emails_found = 0
+    
+    # Process in batches for memory efficiency but maximum speed within batches
+    for i in range(0, len(urls_to_scan), batch_size):
+        if not continuous_running:
+            break
+            
+        batch = urls_to_scan[i:i + batch_size]
+        
+        log(f"� Processing batch {i//batch_size + 1}: {len(batch)} URLs...")
+        
+        # Create all tasks for this batch
+        batch_tasks = []
+        batch_data = []
+        
+        for url_id, url, location, category in batch:
+            task = extract_emails_from_post(url, "Ultra Fast Scan")
+            batch_tasks.append(task)
+            batch_data.append((url_id, url, location, category))
+        
+        try:
+            # Execute batch concurrently
+            results = await asyncio.gather(*batch_tasks, return_exceptions=True)
+            
+            # Process results super fast
+            batch_emails = 0
+            for (url_id, url, location, category), result in zip(batch_data, results):
+                if not continuous_running:
+                    break
+                    
+                try:
+                    if isinstance(result, Exception):
+                        log(f"❌ Scan error {url[:30]}...: {str(result)[:30]}...", verbose_only=True)
+                        mark_url_scanned(url_id, 0, str(result))
+                        processed += 1
+                        continue
+                    
+                    email_data = result
+                    found_email = 0
+                    
+                    if email_data and email_data.get('email'):
+                        # Quick database save
+                        db_tuple = (
+                            email_data['first_name'], email_data['last_name'], email_data['title'],
+                            email_data['company_name'], email_data['email'], email_data['phone'],
+                            email_data['stage'], email_data['linkedin_url'], email_data['location'],
+                            email_data['category'], email_data['url'], email_data['scan_date'],
+                            email_data['raw_name'], email_data['raw_post_title']
+                        )
+                        save_email_to_db(db_tuple)
+                        found_email = 1
+                        batch_emails += 1
+                        log(f"📧 Found: {email_data['email']} @ {email_data['company_name']}", verbose_only=True)
+                    else:
+                        log(f"⚪ No email: {url[:40]}...", verbose_only=True)
+                    
+                    mark_url_scanned(url_id, found_email)
+                    processed += 1
+                    
+                except Exception as e:
+                    mark_url_scanned(url_id, 0, str(e))
+                    processed += 1
+                    continue
+            
+            emails_found += batch_emails
+            log(f"✅ Batch complete: {len(batch)} processed, {batch_emails} emails found")
+            
+        except Exception as e:
+            log(f"❌ Batch error: {e}")
+            # Mark all as failed
+            for url_id, url, location, category in batch_data:
+                mark_url_scanned(url_id, 0, "Batch failed")
+                processed += 1
+    
+    log(f"🎉 Processing complete: {processed} URLs processed, {emails_found} emails found")
+    return processed, emails_found
 
 # Continuous Scanning Functions
 continuous_console_output = ""
@@ -1678,267 +2062,114 @@ def update_continuous_status(status):
     continuous_status_text = status
     return continuous_status_text
 
-async def continuous_scan_worker(main_keywords, location, category, keyword_list, max_results, skip_recent, interval_minutes):
-    """Worker function for continuous scanning"""
-    global continuous_running
-    
-    # Handle optional keyword rotation - if no list provided, use main keywords
-    if keyword_list and keyword_list.strip():
-        keywords = [k.strip() for k in keyword_list.split('\n') if k.strip()]
-        update_continuous_console(f"📝 Using keyword rotation: {len(keywords)} keywords")
-    else:
-        # If no keyword rotation list, use the main keywords field
-        keywords = [main_keywords if main_keywords else ""]
-        update_continuous_console(f"📝 Using main keywords field: '{main_keywords}'")
-    
-    if not keywords or (len(keywords) == 1 and not keywords[0]):
-        keywords = [""]  # Empty search as fallback
-    
-    scan_count = 0
-    
-    while continuous_running:
-        try:
-            # Rotate through keywords (or use main keywords if no rotation list)
-            current_keyword = keywords[scan_count % len(keywords)]
-            scan_count += 1
-            
-            update_continuous_console(f"🔄 Starting continuous scan #{scan_count}")
-            if keyword_list and keyword_list.strip():
-                update_continuous_console(f"📝 Using keyword: '{current_keyword}'")
-            else:
-                update_continuous_console(f"📝 Using main keywords: '{current_keyword}'")
-            update_continuous_status(f"**Continuous Status:** Running (Scan #{scan_count})")
-            
-            # Run the scan
-            results = await scan_craigslist_for_emails(
-                location, category, current_keyword, max_results, skip_recent, update_continuous_console
-            )
-            
-            if not continuous_running:
-                break
-                
-            update_continuous_console(f"✅ Scan #{scan_count} completed")
-            update_continuous_console(f"⏰ Waiting {interval_minutes} minutes before next scan...")
-            
-            # Wait for the specified interval, checking every 2 seconds if we should stop
-            wait_time = interval_minutes * 60
-            for i in range(0, wait_time, 2):
-                if not continuous_running:
-                    break
-                remaining = wait_time - i
-                if remaining > 60:
-                    mins = remaining // 60
-                    update_continuous_status(f"**Continuous Status:** Waiting ({mins}m {remaining%60}s remaining)")
-                else:
-                    update_continuous_status(f"**Continuous Status:** Waiting ({remaining}s remaining)")
-                await asyncio.sleep(2)
-                
-        except Exception as e:
-            update_continuous_console(f"❌ Error in continuous scan: {str(e)}")
-            # Wait less time before retrying for faster recovery
-            await asyncio.sleep(10)
-    
-    update_continuous_console("🛑 Continuous scanning stopped")
-    update_continuous_status("**Continuous Status:** Stopped")
-
 def start_continuous_scan(main_keywords, location, category, keyword_list, max_results, skip_recent, interval_minutes, interval_text):
-    """Start continuous scanning"""
-    global continuous_running, continuous_thread
-    
-    if continuous_running:
-        return "**Continuous Status:** Already running", "⚠️ Continuous scan is already running\n"
-    
-    continuous_running = True
-    update_continuous_console("🚀 Initializing continuous scan...")
-    
-    if keyword_list and keyword_list.strip():
-        update_continuous_console(f"📝 Keywords rotation: {keyword_list.replace(chr(10), ', ')}")
-    else:
-        update_continuous_console(f"📝 Using main keywords: '{main_keywords}'")
-    
-    update_continuous_console(f"⏰ Interval: {interval_text}")
-    
-    # Start the continuous scan in the background
-    import threading
-    def run_continuous():
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            update_continuous_console("🔄 Starting continuous scan thread...")
-            loop.run_until_complete(
-                continuous_scan_worker(
-                    main_keywords, location, category, keyword_list, max_results, skip_recent, interval_minutes
-                )
-            )
-        except Exception as e:
-            update_continuous_console(f"❌ Continuous scan error: {str(e)}")
-            update_continuous_status("**Continuous Status:** Error")
-        finally:
-            loop.close()
-    
-    continuous_thread = threading.Thread(target=run_continuous, daemon=True)
-    continuous_thread.start()
-    
-    update_continuous_status("**Continuous Status:** Starting...")
-    return "**Continuous Status:** Starting...", continuous_console_output
+    """Start continuous scanning - REMOVED"""
+    pass
 
 def stop_continuous_scan():
-    """Stop continuous scanning"""
-    global continuous_running
-    continuous_running = False
-    update_continuous_console("🛑 Stopping continuous scan...")
-    return "**Continuous Status:** Stopping...", continuous_console_output
+    """Stop continuous scanning - REMOVED"""
+    pass
 
 # Gradio Interface
 def create_interface():
     init_database()
     init_url_tracking_db()  # Initialize URL tracking
     
-    with gr.Blocks(title="Craigslist Email Scanner", theme=gr.themes.Soft()) as demo:
+    custom_css = """
+    .big-button {
+        font-size: 18px !important;
+        padding: 15px 30px !important;
+        font-weight: bold !important;
+    }
+    .live-output {
+        font-family: 'Courier New', monospace !important;
+        background-color: #1a1a1a !important;
+        color: #00ff00 !important;
+        border: 2px solid #333 !important;
+    }
+    .status-running {
+        color: #00ff00 !important;
+        font-weight: bold !important;
+    }
+    .status-stopped {
+        color: #ff6b6b !important;
+        font-weight: bold !important;
+    }
+    """
+    
+    with gr.Blocks(title="Craigslist Email Scanner", theme=gr.themes.Soft(), css=custom_css) as demo:
         gr.Markdown("# 📧 Craigslist Email Scanner\nExtract contact information from Craigslist posts efficiently")
         
         with gr.Tabs():
-            with gr.Tab("🔍 Scanner"):
-                with gr.Row():
-                    with gr.Column():
-                        gr.Markdown("### Search Parameters")
-                        location_input = gr.Textbox(
-                            label="Location (optional)", 
-                            placeholder="e.g., seattle, nyc, losangeles",
-                            info="Craigslist city/region identifier"
-                        )
-                        category_input = gr.Textbox(
-                            label="Category (optional)", 
-                            placeholder="e.g., services, gigs, jobs",
-                            info="Craigslist category to focus on"
-                        )
-                        keywords_input = gr.Textbox(
-                            label="Keywords", 
-                            placeholder="e.g., photography, web design, cleaning",
-                            info="What type of services/posts to find"
-                        )
-                        
-                        with gr.Row():
-                            max_results = gr.Slider(10, 200, value=50, step=10, label="Max Results")
-                            skip_recent = gr.Checkbox(label="Skip Recently Scanned (24h)", value=True)
-                        
-                        scan_btn = gr.Button("🚀 Start Scanning", variant="primary", size="lg")
-                        
-                        # Continuous Scan Controls
-                        gr.Markdown("### 🔄 Continuous Scanning")
-                        with gr.Row():
-                            continuous_scan = gr.Checkbox(
-                                label="Enable Continuous Scanning",
-                                value=False,
-                                info="Automatically repeat scans with different keywords/locations"
-                            )
-                            scan_interval = gr.Slider(
-                                0.5, 30, value=1, step=0.5, 
-                                label="Interval (minutes)",
-                                info="Time between scans (0.5-30 minutes for SUPER FAST scanning)"
-                            )
-                        
-                        with gr.Row():
-                            fast_mode = gr.Checkbox(
-                                label="SUPER FAST Mode (seconds)",
-                                value=True,  # Default to super fast
-                                info="Use seconds instead of minutes for LIGHTNING FAST scanning"
-                            )
-                            fast_interval = gr.Slider(
-                                10, 300, value=30, step=10,
-                                label="SUPER FAST Interval (seconds)",
-                                info="Time between scans in seconds (10-300s for maximum speed)"
-                            )
-                        
-                        with gr.Row():
-                            start_continuous_btn = gr.Button("🔄 Start Continuous", variant="primary")
-                            stop_continuous_btn = gr.Button("⏹️ Stop Continuous", variant="secondary")
-                        
-                        with gr.Row():
-                            continuous_status = gr.Markdown("**Continuous Status:** Stopped")
-                            refresh_continuous_btn = gr.Button("🔄 Refresh Status", variant="secondary", size="sm")
-                        
-                        # Keyword rotation for continuous scanning
-                        gr.Markdown("#### Keyword Rotation (optional for continuous scans)")
-                        keyword_list = gr.Textbox(
-                            label="Keyword List (one per line) - Optional",
-                            placeholder="photography\nweb design\ncleaning\nhandyman\ncatering\n\n(Leave empty to use main keywords field)",
-                            lines=4,
-                            info="Different keywords to rotate through during continuous scanning. If empty, will use the main Keywords field above."
-                        )
-                        
-                    with gr.Column():
-                        gr.Markdown("### Live Progress")
-                        console = gr.Textbox(
-                            label="Scan Progress",
-                            placeholder="Scan progress will appear here...",
-                            lines=15,
-                            interactive=False,
-                            show_copy_button=True
-                        )
-                        
-                        scan_status = gr.Markdown("**Status:** Ready to scan")
-                        vpn_rotation_status = gr.Markdown("**VPN Status:** Not monitored")
-            
-            with gr.Tab("🌐 Comprehensive Crawler"):
-                gr.Markdown("### 🔍 Comprehensive Craigslist Crawler\nSystematically scan ALL Craigslist locations and categories")
+            with gr.Tab(" Auto Repeat Crawler"):
+                gr.Markdown("### � One-Click Auto Repeat Crawler\n**Optimized for maximum speed and simplicity - just click START!**")
                 
                 with gr.Row():
-                    with gr.Column():
-                        gr.Markdown("#### Crawler Settings")
+                    with gr.Column(scale=1):
+                        gr.Markdown("#### 🎯 Quick Settings")
                         
-                        max_locations_slider = gr.Slider(
-                            1, 50, value=10, step=1,
-                            label="Max Locations",
-                            info="Number of cities to crawl (1-50)"
-                        )
-                        
-                        max_categories_slider = gr.Slider(
-                            1, 30, value=10, step=1,
-                            label="Max Categories", 
-                            info="Number of categories per city (1-30)"
-                        )
-                        
-                        crawler_batch_size = gr.Slider(
-                            5, 50, value=20, step=5,
-                            label="Batch Size",
-                            info="URLs to process at once"
-                        )
-                        
-                        speed_mode = gr.Radio(
-                            choices=["Normal Speed", "Fast Mode", "ULTRA FAST Mode"],
-                            value="ULTRA FAST Mode",
-                            label="Speed Mode",
-                            info="ULTRA FAST: 50 parallel, 2s timeouts, no delays (MAXIMUM SPEED)"
-                        )
-                        
+                        # Simplified settings - preset for optimal performance
                         with gr.Row():
-                            start_crawler_btn = gr.Button("🚀 Start Comprehensive Crawl", variant="primary", size="lg")
-                            stop_crawler_btn = gr.Button("⏹️ Stop Crawler", variant="secondary")
+                            auto_urls_per_cycle = gr.Slider(
+                                25, 100, value=50, step=25,
+                                label="🎯 URLs per Cycle",
+                                info="More URLs = faster but more resource intensive"
+                            )
+                            
+                            auto_max_cycles = gr.Slider(
+                                5, 50, value=20, step=5,
+                                label="🔄 Max Cycles",
+                                info="How many discover→scan cycles to run"
+                            )
                         
-                        crawler_mode = gr.Radio(
-                            choices=["Discovery Mode", "Queue Processing", "Full Crawl"],
-                            value="Full Crawl",
-                            label="Crawler Mode",
-                            info="Discovery: Find new URLs and add to queue | Queue: Extract emails from existing queue | Full Crawl: Discovery + Queue Processing (RECOMMENDED)"
-                        )
+                        # Big start/stop buttons
+                        with gr.Row():
+                            auto_start_btn = gr.Button(
+                                "🚀 START AUTO REPEAT CRAWL", 
+                                variant="primary", 
+                                size="lg",
+                                elem_classes=["big-button"]
+                            )
+                            auto_stop_btn = gr.Button(
+                                "⏹️ STOP", 
+                                variant="stop", 
+                                size="lg"
+                            )
                         
-                    with gr.Column():
-                        gr.Markdown("#### Crawler Status")
+                        # Live stats
+                        auto_status = gr.Markdown("**Status:** Ready to start")
+                        auto_stats = gr.Markdown("""**Quick Stats:**
+- 🎯 Status: ⏹️ Ready
+- 📋 URLs Pending: Loading...
+- 🔍 Total Scanned: Loading...
+- 📧 Total Emails: Loading...
+- ⚡ Recent Activity: Loading...
+- 📊 Success Rate: Loading...""")
                         
-                        crawler_status = gr.Markdown("**Crawler Status:** Stopped")
+                    with gr.Column(scale=2):
+                        gr.Markdown("#### 📺 Live Activity Monitor")
                         
-                        crawler_console = gr.Textbox(
-                            label="Crawler Progress",
-                            placeholder="Crawler activity will appear here...",
-                            lines=12,
+                        auto_live_output = gr.Textbox(
+                            label="🔴 LIVE CRAWLER OUTPUT",
+                            placeholder="🚀 Click START to begin crawling...\n\n✨ The crawler will:\n1. Find new Craigslist URLs\n2. Extract emails concurrently\n3. Repeat automatically\n4. Show live progress here",
+                            lines=20,
                             interactive=False,
-                            show_copy_button=True
+                            show_copy_button=True,
+                            elem_classes=["live-output"]
                         )
                         
-                        queue_stats = gr.Markdown("**Queue Stats:** Loading...")
-                        
-                        refresh_queue_btn = gr.Button("🔄 Refresh Queue Stats")
+                        # Auto-refresh toggle
+                        with gr.Row():
+                            auto_refresh = gr.Checkbox(
+                                label="📺 Auto-refresh output (every 3 seconds)",
+                                value=True,
+                                info="Keep output updated automatically"
+                            )
+                            super_verbose = gr.Checkbox(
+                                label="🔍 Super Verbose Mode",
+                                value=False,
+                                info="Show detailed technical information (URLs, errors, timing)"
+                            )
             
             with gr.Tab("📧 Results"):
                 with gr.Row():
@@ -2077,35 +2308,6 @@ When enabled, the scanner will automatically change VPN countries every 10-15 se
         # Verbose console actions
         refresh_verbose_btn.click(_refresh_verbose, outputs=[verbose_textbox])
         clear_verbose_btn.click(_clear_verbose, outputs=[verbose_textbox])
-        def run_scan(location, category, keywords, max_results, skip_recent):
-            console_output = ""
-            
-            def update_console(msg):
-                nonlocal console_output
-                console_output += msg + "\n"
-                return console_output
-            
-            try:
-                update_console("🚀 Starting Craigslist scan...")
-                
-                # Run the scan synchronously (we'll make it async in the background)
-                import asyncio
-                new_results = asyncio.run(scan_craigslist_for_emails(
-                    location, category, keywords, max_results, skip_recent, update_console
-                ))
-                
-                # Load all results from database
-                all_results = load_emails_from_db()
-                email_count_value = len(all_results)
-                
-                update_console(f"✅ Scan completed! Total emails in database: {email_count_value}")
-                
-                return console_output, "**Status:** Completed ✅", all_results
-                
-            except Exception as e:
-                update_console(f"❌ Error during scan: {str(e)}")
-                return console_output, "**Status:** Error ❌", load_emails_from_db()
-        
         def refresh_results():
             data = load_emails_from_db()
             count = len(data)
@@ -2255,50 +2457,7 @@ When enabled, the scanner will automatically change VPN countries every 10-15 se
             except Exception as e:
                 return f"### Statistics\n**Error loading stats:** {str(e)}", pd.DataFrame()
         
-        # Connect event handlers
-        scan_btn.click(
-            run_scan,
-            inputs=[location_input, category_input, keywords_input, max_results, skip_recent],
-            outputs=[console, scan_status, results_table]
-        )
-        
-        # Continuous scan handlers
-        def start_continuous_scanning(main_keywords, location, category, keyword_list, max_results, skip_recent, scan_interval, fast_mode, fast_interval):
-            """Handle starting continuous scanning"""
-            # Use fast mode interval if enabled, otherwise use regular interval
-            actual_interval = fast_interval / 60 if fast_mode else scan_interval
-            interval_text = f"{fast_interval}s" if fast_mode else f"{scan_interval}m"
-            
-            # Keywords are now optional - if no keyword list provided, it will use the main keywords field
-            return start_continuous_scan(main_keywords, location, category, keyword_list, max_results, skip_recent, actual_interval, interval_text)
-        
-        def stop_continuous_scanning():
-            """Handle stopping continuous scanning"""
-            return stop_continuous_scan()
-        
-        def get_continuous_updates():
-            """Get current continuous scan status and console output"""
-            global continuous_console_output, continuous_status_text
-            return continuous_status_text, continuous_console_output, load_emails_from_db()
-        
-        # Connect continuous scan events
-        start_continuous_btn.click(
-            start_continuous_scanning,
-            inputs=[keywords_input, location_input, category_input, keyword_list, max_results, skip_recent, scan_interval, fast_mode, fast_interval],
-            outputs=[continuous_status, console]
-        )
-        
-        stop_continuous_btn.click(
-            stop_continuous_scanning,
-            outputs=[continuous_status, console]
-        )
-        
-        # Connect refresh button for continuous status
-        refresh_continuous_btn.click(
-            get_continuous_updates,
-            outputs=[continuous_status, console, results_table]
-        )
-        
+        # Connect event handlers for results and stats
         refresh_btn.click(refresh_results, outputs=[results_table, email_count])
         clear_btn.click(clear_all_results, outputs=[results_table, email_count])
         fix_companies_btn.click(fix_company_names_ui, outputs=[results_table, email_count, fix_status])
@@ -2320,7 +2479,7 @@ When enabled, the scanner will automatically change VPN countries every 10-15 se
             crawler_status_text = status
             return crawler_status_text
         
-        def start_comprehensive_crawler(max_locations, max_categories, batch_size, crawler_mode, speed_mode):
+        def start_comprehensive_crawler(max_locations, max_categories, batch_size, crawler_mode, speed_mode, urls_per_cycle, max_repeat_cycles):
             """Start the comprehensive crawler with speed optimization"""
             global continuous_running, continuous_thread
             
@@ -2332,6 +2491,9 @@ When enabled, the scanner will automatically change VPN countries every 10-15 se
             update_crawler_console(f"📊 Settings: {max_locations} locations, {max_categories} categories, batch size {batch_size}")
             update_crawler_console(f"🔧 Mode: {crawler_mode}")
             update_crawler_console(f"⚡ Speed Mode: {speed_mode}")
+            
+            if crawler_mode == "Auto-Repeat Crawl":
+                update_crawler_console(f"🔄 Auto-Repeat: {urls_per_cycle} URLs per cycle, max {max_repeat_cycles} cycles")
             
             # Adjust batch size based on speed mode
             if speed_mode == "ULTRA FAST Mode":
@@ -2354,10 +2516,15 @@ When enabled, the scanner will automatically change VPN countries every 10-15 se
                         loop.run_until_complete(
                             process_url_queue(update_crawler_console, batch_size, max_cycles=10)
                         )
-                    else:  # Full Crawl
-                        # Use the improved full crawl cycle
+                    elif crawler_mode == "Full Crawl":
+                        # Single cycle: discover some URLs then process them
                         loop.run_until_complete(
-                            full_crawl_cycle(update_crawler_console, max_locations, max_categories, batch_size)
+                            full_crawl_cycle(update_crawler_console, max_locations, max_categories, batch_size, urls_per_cycle)
+                        )
+                    else:  # Auto-Repeat Crawl
+                        # Multiple cycles: discover→scan→repeat
+                        loop.run_until_complete(
+                            auto_repeat_crawl(update_crawler_console, max_locations, max_categories, batch_size, urls_per_cycle, max_repeat_cycles)
                         )
                 except Exception as e:
                     update_crawler_console(f"❌ Crawler error: {str(e)}")
@@ -2396,21 +2563,135 @@ When enabled, the scanner will automatically change VPN countries every 10-15 se
 - **Total Emails Found:** {stats['total_emails']}"""
             return stats_text
         
-        # Connect crawler events
-        start_crawler_btn.click(
-            start_comprehensive_crawler,
-            inputs=[max_locations_slider, max_categories_slider, crawler_batch_size, crawler_mode, speed_mode],
-            outputs=[crawler_status, crawler_console, queue_stats]
+        # Auto Repeat Crawler Event Handlers
+        def start_auto_repeat_crawler(urls_per_cycle, max_cycles, verbose_mode):
+            """Start the optimized auto repeat crawler"""
+            global continuous_running, continuous_thread
+            
+            if continuous_running:
+                return "**Status:** Already running", get_auto_output(), get_auto_stats()
+            
+            continuous_running = True
+            
+            # Clear and initialize live output
+            clear_auto_output()
+            
+            # Initial messages
+            manage_auto_output("🚀 OPTIMIZED AUTO-REPEAT CRAWLER STARTING...")
+            manage_auto_output(f"⚡ ULTRA FAST MODE: Maximum concurrency enabled")
+            manage_auto_output(f"🎯 Configuration: {urls_per_cycle} URLs per cycle, {max_cycles} max cycles")
+            if verbose_mode:
+                manage_auto_output("🔍 SUPER VERBOSE MODE ENABLED - Detailed technical output")
+            manage_auto_output("=" * 60)
+            
+            def update_auto_output(msg):
+                manage_auto_output(msg)
+            
+            import threading
+            def run_auto_crawler():
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    loop.run_until_complete(
+                        optimized_auto_repeat_crawl(update_auto_output, urls_per_cycle, max_cycles, verbose_mode)
+                    )
+                except Exception as e:
+                    update_auto_output(f"❌ Crawler error: {str(e)}")
+                finally:
+                    loop.close()
+                    global continuous_running
+                    continuous_running = False
+                    update_auto_output("🏁 AUTO-REPEAT CRAWLER STOPPED")
+            
+            continuous_thread = threading.Thread(target=run_auto_crawler, daemon=True)
+            continuous_thread.start()
+            
+            status = "**Status:** 🚀 Starting optimized crawler..."
+            stats = get_auto_stats()
+            
+            return status, get_auto_output(), stats
+        
+        def stop_auto_repeat_crawler():
+            """Stop the auto repeat crawler"""
+            global continuous_running
+            continuous_running = False
+            
+            manage_auto_output("🛑 STOP REQUESTED - Crawler will stop after current cycle")
+            
+            status = "**Status:** 🛑 Stopping..."
+            stats = get_auto_stats()
+            
+            return status, get_auto_output(), stats
+        
+        def get_auto_stats():
+            """Get quick stats for auto repeat crawler"""
+            stats = get_queue_stats()
+            emails = get_email_count()
+            
+            # Get recent activity count
+            conn = sqlite3.connect(DB_PATH)
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT COUNT(*) FROM (
+                    SELECT email FROM emails WHERE scan_date >= datetime('now', '-1 hour')
+                    UNION
+                    SELECT url FROM url_queue WHERE scanned_date >= datetime('now', '-1 hour') AND emails_found > 0
+                )
+            ''')
+            recent_activity = cursor.fetchone()[0] or 0
+            conn.close()
+            
+            status_emoji = "🚀" if continuous_running else "⏹️"
+            status_text = "Active" if continuous_running else "Stopped"
+            total_scanned = stats['scanned']
+            
+            return f"""**Quick Stats:**
+- 🎯 Status: {status_emoji} {status_text}
+- 📋 URLs Pending: {stats['pending']}
+- 🔍 Total Scanned: {total_scanned}
+- 📧 Total Emails: {emails}
+- ⚡ Recent Activity: {recent_activity}/hour
+- 📊 Success Rate: {(emails/max(total_scanned,1)*100):.1f}%"""
+        
+        # Connect auto repeat crawler events
+        auto_start_btn.click(
+            start_auto_repeat_crawler,
+            inputs=[auto_urls_per_cycle, auto_max_cycles, super_verbose],
+            outputs=[auto_status, auto_live_output, auto_stats]
         )
         
-        stop_crawler_btn.click(
-            stop_comprehensive_crawler,
-            outputs=[crawler_status, crawler_console, queue_stats]
+        auto_stop_btn.click(
+            stop_auto_repeat_crawler,
+            outputs=[auto_status, auto_live_output, auto_stats]
         )
         
-        refresh_queue_btn.click(
-            refresh_queue_stats,
-            outputs=[queue_stats]
+        # Auto-refresh functionality for live output
+        def refresh_auto_output():
+            """Refresh the auto crawler output and stats"""
+            stats = get_auto_stats()
+            output = get_auto_output()
+            if continuous_running:
+                status = "**Status:** 🚀 Running"
+            else:
+                status = "**Status:** ⏹️ Stopped"
+            return status, output, stats
+        
+        # Simple auto-refresh timer - only runs when checkbox is enabled
+        auto_refresh_timer = gr.Timer(value=3.0, active=False)  # 3 second refresh, start inactive
+        auto_refresh_timer.tick(
+            refresh_auto_output,
+            outputs=[auto_status, auto_live_output, auto_stats]
+        )
+        
+        # Control auto-refresh based on checkbox
+        def toggle_auto_refresh(enabled):
+            """Toggle the auto-refresh timer on/off"""
+            return gr.Timer(active=enabled)
+        
+        auto_refresh.change(
+            toggle_auto_refresh,
+            inputs=[auto_refresh],
+            outputs=[auto_refresh_timer]
         )
         
         # VPN Event Handlers
@@ -2644,16 +2925,15 @@ if __name__ == "__main__":
     
     demo = create_interface()
     local_ip = get_local_ip()
-    port = 7861
+    port = 7863
     
     print("=" * 60)
     print("🔍 CRAIGSLIST SCANNER - VPN & SSH FRIENDLY STARTUP")
     print("=" * 60)
-    print(f"🌐 Local IP: {local_ip}")
     print(f"🔌 Port: {port}")
     print("📍 Access URLs:")
     print(f"   • Localhost: http://localhost:{port}")
-    print(f"   • Local IP:  http://{local_ip}:{port}")
+    print(f"   • Your Network: http://192.168.1.107:{port}")
     print(f"   • All IPs:   http://0.0.0.0:{port}")
     print("")
     print("� SSH/VS Code Access:")
@@ -2662,7 +2942,7 @@ if __name__ == "__main__":
     print(f"   • Then access: http://localhost:{port}")
     print("")
     print("�💡 Connection Tips:")
-    print("   • VPN: If localhost doesn't work, try the Local IP URL")
+    print("   • VPN: If localhost doesn't work, try the Network IP URL")
     print("   • SSH: Use port forwarding for remote access")
     print("   • VS Code: Use 'Forward a Port' in terminal panel")
     print("   • Check VPN settings to allow local network access")
@@ -2672,7 +2952,7 @@ if __name__ == "__main__":
     # Launch with VPN-friendly and SSH-friendly settings
     demo.launch(
         server_name="0.0.0.0",  # Bind to all interfaces for VPN/SSH compatibility
-        server_port=port,
+        server_port=7861,       # Back to original port
         share=False,
         inbrowser=False,        # Don't auto-open browser (better for SSH)
         debug=False,
