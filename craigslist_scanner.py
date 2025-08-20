@@ -2041,7 +2041,7 @@ async def optimized_auto_repeat_crawl(progress_callback=None, auto_optimize=True
             # Only stop if we discovered nothing AND don't have pending URLs to process
             log(f"⚠️ No URLs available in cycle {cycle_count}")
             log("💡 This might mean we've found all available posts")
-            if cycle > 3:  # Only break after a few cycles
+            if cycle_count > 3:  # Only break after a few cycles
                 log("🏁 Ending crawl - no more URLs available")
                 break
             else:
@@ -2060,7 +2060,7 @@ async def optimized_auto_repeat_crawl(progress_callback=None, auto_optimize=True
         
         # Cycle summary
         cycle_time = (datetime.now() - cycle_start).total_seconds()
-        log(f"🎉 CYCLE {cycle} COMPLETE in {cycle_time:.1f}s")
+        log(f"🎉 CYCLE {cycle_count} COMPLETE in {cycle_time:.1f}s")
         log(f"📊 This cycle: +{discovered} URLs, +{processed} processed, +{emails_found} emails")
         
         # Running totals
@@ -2084,7 +2084,7 @@ async def optimized_auto_repeat_crawl(progress_callback=None, auto_optimize=True
     log("\n" + "=" * 60)
     log("🏁 AUTO-REPEAT CRAWL COMPLETE!")
     log(f"📊 FINAL RESULTS:")
-    log(f"   🎯 Cycles completed: {cycle}")
+    log(f"   🎯 Cycles completed: {cycle_count}")
     log(f"   📋 URLs discovered: {total_discovered}")
     log(f"   ⚡ URLs processed: {total_processed}")
     log(f"   📧 Emails found: {total_emails}")
