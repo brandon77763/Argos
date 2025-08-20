@@ -1555,32 +1555,36 @@ async def comprehensive_craigslist_crawl(progress_callback=None, max_locations=1
     log(f"🎉 Crawl complete! Discovered {total_discovered} new URLs")
     return total_discovered
 
-async def process_url_queue(progress_callback=None, batch_size=10):
-    """Process URLs from the queue systematically"""
+async def process_url_queue(progress_callback=None, batch_size=10, max_cycles=10):
+    """Process URLs from the queue systematically with multiple processing cycles"""
     
     def log(msg):
         if progress_callback:
             progress_callback(msg)
     
-    processed = 0
+    processed_total = 0
+    cycles = 0
     
-    while continuous_running:
+    while continuous_running and cycles < max_cycles:
+        cycles += 1
+        log(f"🔄 Starting processing cycle {cycles}/{max_cycles}")
+        
         # Get next batch of URLs to scan
         urls_to_scan = get_next_urls_to_scan(batch_size)
         
         if not urls_to_scan:
-            log("📋 URL queue is empty - starting discovery crawl...")
-            await comprehensive_craigslist_crawl(progress_callback, max_locations=5, max_categories=5)
-            continue
+            log("📋 URL queue is empty for this cycle")
+            break
         
-        log(f"📄 Processing {len(urls_to_scan)} URLs from queue...")
+        log(f"📄 Processing {len(urls_to_scan)} URLs from queue (Cycle {cycles})...")
         
+        cycle_processed = 0
         for url_id, url, location, category in urls_to_scan:
             if not continuous_running:
                 break
                 
             try:
-                log(f"🔍 Scanning: {url}")
+                log(f"🔍 Scanning [{cycles}-{cycle_processed+1}]: {url[:60]}...")
                 
                 # Extract emails from this URL
                 email_data = await extract_emails_from_post(url, f"Queue scan")
@@ -1597,29 +1601,65 @@ async def process_url_queue(progress_callback=None, batch_size=10):
                     )
                     save_email_to_db(db_tuple)
                     emails_found = 1
-                    log(f"✅ Found email")
+                    log(f"✅ Found email: {email_data['email']}")
                 
                 # Mark as scanned
                 mark_url_scanned(url_id, emails_found)
-                processed += 1
+                cycle_processed += 1
+                processed_total += 1
                 
-                # ULTRA FAST - no rate limiting for maximum speed
-                # await asyncio.sleep(0.1)  # Commented out for ultra speed
+                # ULTRA FAST - minimal delay
+                await asyncio.sleep(0.1)
                 
             except Exception as e:
                 log(f"❌ Error processing {url}: {str(e)}")
                 mark_url_scanned(url_id, 0, str(e))
                 continue
         
-        # Show queue stats
-        stats = get_queue_stats()
-        log(f"📊 Queue stats: {stats['pending']} pending, {stats['scanned']} scanned, {stats['total_emails']} total emails")
+        log(f"📊 Cycle {cycles} complete: Processed {cycle_processed} URLs")
         
-        # ULTRA FAST - no pause between batches for maximum speed
-        # await asyncio.sleep(0.2)  # Commented out for ultra speed
+        # Show queue stats after each cycle
+        stats = get_queue_stats()
+        log(f"� Queue stats: {stats['pending']} pending, {stats['scanned']} scanned, {stats['total_emails']} total emails")
+        
+        # Brief pause between cycles
+        await asyncio.sleep(0.5)
     
-    log(f"🏁 Queue processing stopped. Processed {processed} URLs")
-    return processed
+    if cycles >= max_cycles:
+        log(f"🏁 Completed {max_cycles} processing cycles. Total processed: {processed_total} URLs")
+    else:
+        log(f"🏁 Queue processing complete. Total processed: {processed_total} URLs")
+    
+    return processed_total
+
+async def full_crawl_cycle(progress_callback=None, max_locations=10, max_categories=10, batch_size=20):
+    """Complete crawl cycle: Discovery + Queue Processing + Repeat"""
+    
+    def log(msg):
+        if progress_callback:
+            progress_callback(msg)
+    
+    log("🚀 Starting FULL CRAWL CYCLE...")
+    log("📋 Phase 1: Discovery - Finding new URLs")
+    
+    # Phase 1: Discovery
+    discovered = await comprehensive_craigslist_crawl(progress_callback, max_locations, max_categories)
+    
+    if not continuous_running:
+        return
+    
+    log(f"✅ Discovery complete. Found {discovered} new URLs")
+    log("📧 Phase 2: Processing - Extracting emails from URLs")
+    
+    # Phase 2: Process the queue
+    processed = await process_url_queue(progress_callback, batch_size, max_cycles=5)
+    
+    log(f"🎉 FULL CRAWL CYCLE COMPLETE!")
+    log(f"📊 Summary: {discovered} URLs discovered, {processed} URLs processed")
+    
+    # Show final stats
+    stats = get_queue_stats()
+    log(f"📈 Final stats: {stats['pending']} pending, {stats['scanned']} scanned, {stats['total_emails']} total emails")
 
 # Continuous Scanning Functions
 continuous_console_output = ""
@@ -1880,7 +1920,7 @@ def create_interface():
                             choices=["Discovery Mode", "Queue Processing", "Full Crawl"],
                             value="Full Crawl",
                             label="Crawler Mode",
-                            info="Discovery: Parse category pages to find new URLs only | Queue: Extract emails from queued URLs only | Full: Discovery + Queue processing"
+                            info="Discovery: Find new URLs and add to queue | Queue: Extract emails from existing queue | Full Crawl: Discovery + Queue Processing (RECOMMENDED)"
                         )
                         
                     with gr.Column():
@@ -2312,18 +2352,13 @@ When enabled, the scanner will automatically change VPN countries every 10-15 se
                         )
                     elif crawler_mode == "Queue Processing":
                         loop.run_until_complete(
-                            process_url_queue(update_crawler_console, batch_size)
+                            process_url_queue(update_crawler_console, batch_size, max_cycles=10)
                         )
                     else:  # Full Crawl
-                        # First discover URLs
+                        # Use the improved full crawl cycle
                         loop.run_until_complete(
-                            comprehensive_craigslist_crawl(update_crawler_console, max_locations, max_categories)
+                            full_crawl_cycle(update_crawler_console, max_locations, max_categories, batch_size)
                         )
-                        # Then process the queue
-                        if continuous_running:
-                            loop.run_until_complete(
-                                process_url_queue(update_crawler_console, batch_size)
-                            )
                 except Exception as e:
                     update_crawler_console(f"❌ Crawler error: {str(e)}")
                     update_crawler_status("**Crawler Status:** Error")
